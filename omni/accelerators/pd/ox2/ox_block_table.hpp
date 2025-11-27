@@ -146,6 +146,66 @@ public:
         return buffers;
     }
 
+    std::vector<boost::asio::mutable_buffer> get_buffers_one_layer(
+        table_id_t table_id, const block_list_t &block_ids, int rank, size_t layer_id)
+    {
+        char *ptr = table_addr(table_id);
+        size_t tp_size = config.tp_size();
+
+        std::vector<boost::asio::mutable_buffer> buffers;
+        // buffers.reserve(blocks.size() * block_ids.size());
+
+        for(size_t i = 0; i < blocks.size(); ++i) {
+            char *base = ptr + block_offset[i];
+            for (auto block_id : block_ids) {
+                void* layer = base + layer_id * layer_size[i] + block_id * block_layer_size[i] +
+                             (block_layer_size[i] * rank) / tp_size;
+                buffers.emplace_back(layer, block_layer_size[i] / tp_size);
+            }
+        }
+
+        return buffers;
+    }
+
+    std::vector<boost::asio::mutable_buffer> get_buffers_layerwise(table_id_t table_id,
+                                  block_list_t &block_ids,
+                                  int rank)
+    {
+        char *ptr = table_addr(table_id);
+        size_t tp_size = config.tp_size();
+
+        std::vector<boost::asio::mutable_buffer> buffers;
+        size_t num_layers = config.num_layers;
+
+        // final buffer count = layers × segments × blocks
+        buffers.reserve(num_layers * blocks.size() * block_ids.size());
+
+        for (size_t layer = 0; layer < num_layers; layer++) {
+
+            for (size_t seg = 0; seg < blocks.size(); seg++) {
+                char *base = ptr + block_offset[seg];
+
+                size_t layer_sz = layer_size[seg];
+                size_t block_layer_sz = block_layer_size[seg];
+
+                for (auto block_id : block_ids) {
+
+                    void *layer_ptr =
+                        base
+                        + layer * layer_sz
+                        + block_id * block_layer_sz
+                        + (block_layer_sz * rank) / tp_size;
+
+                    buffers.emplace_back(layer_ptr, block_layer_sz / tp_size);
+                }
+            }
+        }
+
+        return buffers;
+    }
+
+
+    /*
     std::vector<boost::asio::mutable_buffer> get_buffers_layerwise(
         table_id_t table_id, block_list_t &block_ids, int rank)
     {
@@ -169,6 +229,7 @@ public:
 
         return buffers;
     }
+    */
 
     std::vector<boost::asio::mutable_buffer> get_buffers_interleaved(
         table_id_t table_id, block_list_t &block_ids, int rank)

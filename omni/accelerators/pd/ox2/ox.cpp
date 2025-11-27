@@ -15,6 +15,7 @@
 #include <ox_server.hpp>
 #include <ox_log.hpp>
 #include <ox_kv_merger.h>
+#include <ox_request_manager.hpp>
 #include <chrono>
 #include <boost/asio/experimental/parallel_group.hpp>
 #include <boost/asio/experimental/promise.hpp>
@@ -63,7 +64,7 @@ public:
 
     void start()
     {
-        asio::co_spawn(socket.get_executor(), run(), asio::detached);
+        co_spawn(socket.get_executor(), run(), asio::detached);
     }
 
     asio::awaitable<void> run()
@@ -71,14 +72,23 @@ public:
         try {
             co_await socket.async_connect(addr, asio::use_awaitable);
             optimize_tcp_socket(socket);
+            // Log: Successful connection
+            std::cerr << "[D_SIDE_CONN] INFO: Successfully connected to P-side shard at " << addr.address() << ":"
+                      << addr.port() << "\n";
+
 
             while (true) {
+                std::cerr << "[D_SIDE_CONN] while ..." << std::endl;
                 auto [request_id, table_id, src_ids, dst_ids] = co_await request.async_receive(asio::use_awaitable);
+                std::cerr << "[D] receive data for request " << request_id 
+                          << " table_id = ..." << table_id
+                          << std::endl;
 
                 if (src_ids.empty()) {
                     // no task, return empty immediately
                     co_await upstream.async_send(
                         boost::system::error_code{}, std::make_tuple(request_id, dst_ids), asio::use_awaitable);
+                    std::cerr << "[D] src_ids.empty()." << std::endl;
                     continue;
                 }
 
@@ -87,6 +97,7 @@ public:
 
                 // auto bufs = bt.get_buffers_interleaved(table_id, dst_ids, rank);
                 auto bufs = bt.get_buffers_layerwise(table_id, dst_ids, rank);
+                
                 // for (auto id : src_ids) {
                 //     std::cout << "Request for ID:" << id << std::endl;
                 // }
@@ -95,10 +106,30 @@ public:
                 // }
                 // std::cout << "Buf size:" << bufs.size()/dst_ids.size() << std::endl;
 
+
+                for (block_id_t id : src_ids) {
+                        std::cout << id << " ";
+                    }
+                std::cout << std::endl;
+
+                int64_t uid = generate_uid_from_block_list(src_ids);
+                std::cerr << "[D] computed uid = " << uid << std::endl;
+                
+                try {
+                // co_await asio::async_write(socket, asio::buffer(&uid, sizeof(uid)), asio::use_awaitable);
+                // co_await asio::async_read(socket, bufs, asio::use_awaitable);
                 co_await (asio::async_write(socket,
-                              asio::buffer(src_ids.data(), src_ids.size() * sizeof(block_id_t)),
+                              asio::buffer(&uid, sizeof(uid)),
                               asio::use_awaitable) &&
                           asio::async_read(socket, bufs, asio::use_awaitable));
+                }catch (const std::exception &e) {
+                std::cerr << "[D] async_read FAILED:" << e.what() << std::endl;
+            }
+                
+                
+                std::cerr << "[D] Receive data from P-side. Buffers count=" << bufs.size() 
+                          << " first bytes=" << *(int64_t*)bufs[0].data()
+                          << std::endl;
 
                 // #ifdef CONTENT_CHECK
                 //                 for (size_t i = 0; i < src_ids.size(); i++)
@@ -114,6 +145,7 @@ public:
                 // return finished dst_ids
                 co_await upstream.async_send(
                     boost::system::error_code{}, std::make_tuple(request_id, dst_ids), asio::use_awaitable);
+                
             }
         } catch (const std::exception &e) {
             std::cerr << "Connection " << addr.address() << ":" << addr.port() << " error: " << e.what() << "\n";
@@ -331,7 +363,7 @@ public:
         bool failed = false;
 
         for (auto block_id : block_ids) {
-            tasks.push_back(boost::asio::co_spawn(
+            tasks.push_back(co_spawn(
                 ex,
                 [table_id, block_id, request_id, &failed, this]() -> boost::asio::awaitable<void> {
                     void *ptr = bt.block_addr(table_id, block_id);
@@ -534,7 +566,7 @@ int main(int argc, char *argv[])
 
         std::vector<std::shared_ptr<Server>> server_list;
         for (auto &endpoint : config.server_list) {
-            server_list.emplace_back(std::make_shared<Server>(io_context, endpoint, bt));
+            server_list.emplace_back(std::make_shared<Server>(io_context, endpoint, bt, config.num_layers, config.zmq_port));
         }
 
         for (auto &server : server_list) {

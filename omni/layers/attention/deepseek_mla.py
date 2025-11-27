@@ -56,6 +56,10 @@ from omni.adaptors.vllm.distributed.parallel_state import (
 from omni.models.config_loader.loader import model_extra_config
 from omni.layers.utils import ConditionalTNGScope
 
+from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                          has_kv_transfer_group,
+                                          is_v1_kv_transfer_group)
+
 try:
     import custom_ops
 except:
@@ -663,6 +667,11 @@ class DeepseekMLA(nn.Module):
             self.q_a_proj.weight = self._process_mla_prolog_weight(self.q_a_proj.weight)
             self.q_b_proj.weight = self._process_mla_prolog_weight(self.q_b_proj.weight)
             self.kv_a_proj_with_mqa.weight = self._process_mla_prolog_weight(self.kv_a_proj_with_mqa.weight)
+
+        # save layer kv to connctor for kv transfer layerwisely
+        if attn_metadata is None or attn_metadata.prefill is not None:
+            maybe_save_kv_layer_to_connector(self.layer_idx, attn_metadata)
+
         return output
 
     def _process_mla_prolog_weight(self, weight):
@@ -1537,3 +1546,13 @@ class DeepseekMLA(nn.Module):
 
         attn_output = None
         return output
+
+# call this function to save kv layer to connector for kv transfer
+def maybe_save_kv_layer_to_connector(layer_idx, attn_metadata):
+    # only v1 kv transfer group support save kv layer
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if attn_metadata is None:
+        return
+    connector.save_kv_layer(layer_idx, attn_metadata)

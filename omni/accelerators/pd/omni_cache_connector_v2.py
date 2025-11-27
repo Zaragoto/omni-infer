@@ -58,7 +58,7 @@ BLOCK_RELEASE_DELAY = 3000
 PER_REQUEST_CONNECTION = 8
 
 BASE_DIR = os.path.dirname(__file__)
-OX_PATH = os.environ.get("OX_PATH", os.path.join(BASE_DIR, "ox/ox"))
+OX_PATH = os.environ.get("OX_PATH", os.path.join(BASE_DIR, "ox2/ox")) # call the ox for layerwise kv transfer
 OX_LOG_PATH = os.environ.get("OX_LOG_PATH", os.path.join("/data/ox_log"))
 
 # Cluster/P-node configuration
@@ -76,6 +76,7 @@ BASE_PORT = int(os.environ.get("BASE_PORT", "15077"))
 ZMQ_BASE_PORT = int(os.environ.get("ZMQ_BASE_PORT", "17555"))
 ZMQ_DECODE_PUSH_REQUEST_TO_PREFILL_PORT = int(os.environ.get("ZMQ_DECODE_PUSH_REQUEST_TO_PREFILL_PORT", "17556"))
 ZMQ_PREFILL_PUSH_INFORMATION_TO_DECODE_BASE_PORT = int(os.environ.get("ZMQ_PREFILL_PUSH_INFORMATION_TO_DECODE_BASE_PORT", "17557"))
+ZMQ_LAYER_PORT = int(os.environ.get("ZMQ_LAYER_PORT", "25555")) # port for ox server to receive layerwise kv transfer
 
 P_NODE_PORT_LIST = ';'.join(
     ','.join(f"{h.strip()}:{BASE_PORT}" for h in grp.split(',') if h.strip())
@@ -201,7 +202,7 @@ class RouterDealerClient:
         self.socket.setsockopt(zmq.IDENTITY, client_id)
 
         self.socket.connect(server_address)
-        print(f"Connected to server at {server_address} with ID: {client_id.decode()}")
+        logger.warning(f"Connected to server at {server_address} with ID: {client_id.decode()}")
 
     def send_request(self, request_id: str, cluster_id: int, src_id_list: List[int], dst_id_list: List[int], rank_id: int) -> bool:
         try:
@@ -216,7 +217,7 @@ class RouterDealerClient:
             self.socket.send(packed_data)
             return True
         except Exception as e:
-            print(f"Error sending request {request_id}: {e}")
+            logger.warning(f"Error sending request {request_id}: {e}")
             return False
 
     def receive_response(self, timeout: int = 1000) -> Optional[Dict]:
@@ -226,13 +227,13 @@ class RouterDealerClient:
                 response = msgpack.unpackb(response_data)
                 return response
         except Exception as e:
-            print(f"Error receiving response: {e}")
+            logger.warning(f"Error receiving response: {e}")
         return None
 
     def close(self):
         self.socket.close()
         self.context.term()
-        print("Client closed")
+        logger.warning("Client closed")
 
 
 @dataclass
@@ -383,10 +384,15 @@ class LLMDataDistConnector(KVConnectorBase_V1):
         """Connector does not do layerwise saving."""
         pass
 
-    def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
+    # this function is called now for layerwise send kv in prefill instance 
+    def save_kv_layer(self, layer_name: str,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
-        """Connector does not save explicitly."""
-        pass
+        if self.connector_worker is None:
+            raise RuntimeError("self.connector_scheduler cannot be None")
+        if self.is_prefill:
+            return self.connector_worker.save_kv_layer(layer_name, attn_metadata)
+        else:
+            pass
 
     def wait_for_save(self):
         """Connector does not save explicitly."""
@@ -439,7 +445,7 @@ class PrefillConnectorScheduler:
                 if self.input_socket.poll(timeout = 100) > 0:
                     decode_request_msg = self.input_socket.recv_string()
                     decode_request = json.loads(decode_request_msg)
-                    logger.debug(f"Received:{decode_request}")
+                    logger.warning(f"Received:{decode_request}")
                     with self._decode_requests_lock:
                         self.decode_requests_dict.update(decode_request)
             except Exception as e:
@@ -454,7 +460,25 @@ class PrefillConnectorScheduler:
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
-        pass
+        # get block ids from blocks
+        block_ids = blocks.get_block_ids()[0]
+        spec_token_ids = []
+        # the payload for pull kv metadata should be sent to decode side immediately after allocation
+        payload = dict(
+            remote_block_ids=block_ids,
+            remote_cluster_id=self.cluster_id_start,
+            remote_host_ip=f"tcp://{self.host_ip}:{self.host_port}",
+            spec_token_ids=spec_token_ids,
+            remote_dp_rank=self.vllm_config.parallel_config.data_parallel_rank,
+            remote_request_id=request.request_id,
+        )
+        
+        delay_free_blocks = len(block_ids) > 0
+        
+        if delay_free_blocks:
+            with self._prefill_cv:
+                self._prefill_pending[request.request_id] = payload
+                self._prefill_cv.notify()
 
     def build_connector_metadata(
             self,
@@ -491,15 +515,9 @@ class PrefillConnectorScheduler:
             remote_host_ip=f"tcp://{self.host_ip}:{self.host_port}",
             spec_token_ids=spec_token_ids,
             remote_dp_rank=self.vllm_config.parallel_config.data_parallel_rank,
-            remote_request_id=request.request_id
+            remote_request_id=request.request_id,
         )
 
-        if delay_free_blocks:
-            # Use the Condition to guard and notify; do NOT nest with the raw lock
-            with self._prefill_cv:
-                self._prefill_pending[request.request_id] = payload
-                # notify background thread that new item available
-                self._prefill_cv.notify()
         return delay_free_blocks, payload
 
     def _prefill_sender_loop(self):
@@ -584,6 +602,8 @@ class PrefillConnectorWorker:
         self.host_port = host_port
         self.vllm_config = vllm_config
         self.rank = get_tensor_model_parallel_rank()
+        # need tp_rank_local so that each P node can send kv to its corresponding decode node
+        self.tp_rank_local = self.rank % (self.vllm_config.parallel_config.tensor_parallel_size // CLUSTER_SIZE)
         if self.rank == 0:
             self.ctx = zmq.Context()
             self.input_socket = self.ctx.socket(zmq.constants.PULL)
@@ -609,12 +629,20 @@ class PrefillConnectorWorker:
         # initialize the dict to save requests finish time
         self.requests_finish_time: Dict[str, float] = {}
 
+        # each P node starts an zmq PUSH socket to send layerwise kv to ox server
+        if self.tp_rank_local == 0:
+            ctx_layer = zmq.Context()
+            self.sock_layer = ctx_layer.socket(zmq.PUSH)
+            self.sock_layer.RCVTIMEO = 5000  # ms
+            self.sock_layer.SNDTIMEO = 2000
+            self.sock_layer.connect(f"tcp://{self.host_ip}:{ZMQ_LAYER_PORT}")
+
+
     def register_kv_caches(self, kv_pool_mmap_path, data_type, block_len_dtype, omni_cache=None):
         logger.warning(f" ======= OX parameters for P server: {kv_pool_mmap_path=}, {data_type=}, {block_len_dtype=}")
         self._start_p_server_kv_transfer(kv_pool_mmap_path, data_type, block_len_dtype, omni_cache)
 
     def _start_p_server_kv_transfer(self, kv_pool_mmap_path, data_type, block_len_dtype, omni_cache):
-        self.tp_rank_local = self.rank % (self.vllm_config.parallel_config.tensor_parallel_size // CLUSTER_SIZE)
         data_type_size = DTypeUtils.size(data_type)
         if self.tp_rank_local == 0:
             cmd = [
@@ -625,6 +653,7 @@ class PrefillConnectorWorker:
                 "--num-layers", str(omni_cache.num_layers),
                 "--tokens-per-block", str(omni_cache.node_block_size),
                 "--dims",  ",".join(map(str, omni_cache.head_sizes)),
+                "--zmq-port", str(ZMQ_LAYER_PORT) # add new zmq port parameter for ox server to receive layerwise kv transfer flag
                 # "--block-size", str(block_len_dtype * data_type_size), # no block size parameter now
             ]
             logger.warning(f"<<<Executing {cmd}")
@@ -651,6 +680,34 @@ class PrefillConnectorWorker:
 
     def start_load_kv(self, metadata: DatadistConnectorMetadataPrefill):
         pass
+
+    # newly added function for prefill instance to send layerwise kv to ox server
+    def save_kv_layer(self, layer_idx: int,
+                      attn_metadata: "AttentionMetadata") -> None:
+        """ do this operaiton only when tp_rank_local == 0 """
+        if self.tp_rank_local == 0:
+            block_table_tensor = attn_metadata.prefill.block_table
+            block_tables = [sub[sub != 0].tolist() for sub in block_table_tensor]
+            if isinstance(block_tables[0], int):
+                block_tables = [block_tables]
+            for block_table in block_tables:
+                if block_table != []:
+                    # only "layer_id" and "block_ids" are used in ox server now, other fields need to be removed later
+                    cmd = {
+                            "table_id": 0,
+                            "layer_id": layer_idx,
+                            "block_ids": block_table,
+                            "rank": 0
+                        }
+                    packed = msgpack.packb(cmd)
+                    try:
+                        self.sock_layer.send(packed, zmq.NOBLOCK)
+                        logger.warning(f"[ZMQ controller] sent layer {layer_idx} to ox server")
+                    except Exception as e:
+                        logger.warning("[ZMQ controller] failed to send:", e)
+                        break
+        else:
+            pass
 
     def get_finished(self, metadata: DatadistConnectorMetadataPrefill) -> Tuple[set[str], set[str]]:
         """
@@ -1076,6 +1133,24 @@ class DecodeConnectorWorker:
         remote_request_id: Optional[str],
         remote_host_ip: str
     ):
+        # only for debug, need to be removed after a stable version is ready
+        logger.warning("\n========== PY DEBUG (_read_blocks entry) ==========")
+        logger.warning(">>> PY DEBUG: sending to ox:", {
+            "local_block_ids": local_block_ids,
+            "remote_block_ids": remote_block_ids,
+            "dst_cluster_id": dst_cluster_id,
+            "request_id": request_id,
+            "remote_request_id": remote_request_id,
+            "remote_host_ip": remote_host_ip,
+        })
+        logger.warning(">>> PY DEBUG TYPES:", {
+            "type_local_block_ids": type(local_block_ids),
+            "type_remote_block_ids": type(remote_block_ids),
+            "type_dst_cluster_id": type(dst_cluster_id),
+            "type_request_id": type(request_id),
+            "type_remote_request_id": type(remote_request_id),
+        })
+        logger.warning("===================================================\n")
         start = time.time()
 
         self._ensure_resp_thread_started()
@@ -1092,9 +1167,22 @@ class DecodeConnectorWorker:
                 t_submit=start,
             )
 
+        # only for debug, need to be removed after a stable version is ready
+        final_payload={
+            "request_id": request_id,
+            "cluster_id": int(dst_cluster_id),
+            "src_id_list": remote_block_ids,
+            "dst_id_list": local_block_ids[1],
+            "rank_id": self.omni_cache.dp_local_rank,
+        }
+        logger.warning("\n========== PY FINAL SENT TO OX ==========")
+        logger.warning(final_payload)
+        logger.warning("FINAL TYPES:", {k: type(v) for k, v in final_payload.items()})
+        logger.warning("\n=========================================")
+
         self.zmq_client.send_request(
             request_id=request_id,
-            cluster_id=dst_cluster_id,
+            cluster_id=int(dst_cluster_id),
             src_id_list=remote_block_ids,
             dst_id_list=local_block_ids[0],
             rank_id=self.omni_cache.dp_local_rank,

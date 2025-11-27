@@ -44,8 +44,8 @@ struct Config {
     size_t table_size;
 
     size_t num_threads = 16;
-    size_t connections_per_shard = 16;
-    size_t connections_per_req = 4;
+    size_t connections_per_shard = 1;
+    size_t connections_per_req = 1;
     int zmq_port = 5555;
 
     inline size_t block_table_size() const
