@@ -43,7 +43,7 @@ struct ResponseMessage {
     MSGPACK_DEFINE_MAP(request_id, layer_id, success)
 };
 
-using ResponseTask = std::tuple<client_id_t, request_id_t, int, bool>;  // 修改：增加layer_id
+using ResponseTask = std::tuple<client_id_t, request_id_t, int, bool>;
 using ZMQChannel = concurrent_channel<asio::any_io_executor, void(boost::system::error_code, ResponseTask)>;
 
 using ConnectionMessage = std::tuple<request_id_t, table_id_t, block_list_t, block_list_t>;
@@ -58,9 +58,9 @@ using GroupChannel = concurrent_channel<asio::any_io_executor, void(boost::syste
 class CoroutineConnection {
 public:
     CoroutineConnection(asio::io_context &io_context, boost::asio::ip::tcp::endpoint addr, Config &config, int rank,
-        BlockTable &bt, ShardChannel &response)  // 恢复使用ShardChannel
+        BlockTable &bt, ShardChannel &response)
         : socket(io_context), config(config), rank(rank), addr(addr), bt(bt), request(config.get_io_context(), 128),
-          upstream(response)  // 恢复upstream
+          upstream(response)
     {}
 
     void start()
@@ -77,11 +77,11 @@ public:
                       << addr.port() << "\n";
 
             while (true) {
-                std::cerr << "[D_SIDE_CONN] while ..." << std::endl;
                 auto [request_id, table_id, src_ids, dst_ids] = co_await request.async_receive(asio::use_awaitable);
                 std::cerr << "[D] receive data for request " << request_id 
-                          << " table_id = ..." << table_id
-                          << std::endl;
+                          << " table_id = " << table_id
+                          << " src_ids count=" << src_ids.size()
+                          << " dst_ids count=" << dst_ids.size() << std::endl;
 
                 if (src_ids.empty()) {
                     co_await upstream.async_send(
@@ -90,35 +90,47 @@ public:
                     continue;
                 }
 
-                auto bufs = bt.get_buffers_layerwise(table_id, dst_ids, rank);
-                
-                for (block_id_t id : src_ids) {
-                    std::cout << id << " ";
-                }
-                std::cout << std::endl;
+                // 使用简单的缓冲区获取方式，避免复杂的层状结构
+                auto bufs = bt.get_buffers(table_id, dst_ids, rank);
+                std::cerr << "[D] Got " << bufs.size() << " buffers for request " << request_id << std::endl;
 
                 int64_t uid = generate_uid_from_block_list(src_ids);
                 std::cerr << "[D] computed uid = " << uid << std::endl;
                 
                 try {
-                    co_await (asio::async_write(socket,
-                                  asio::buffer(&uid, sizeof(uid)),
-                                  asio::use_awaitable) &&
-                              asio::async_read(socket, bufs, asio::use_awaitable));
+                    // 先发送UID
+                    co_await asio::async_write(socket, asio::buffer(&uid, sizeof(uid)), asio::use_awaitable);
+                    std::cerr << "[D] Sent uid to server" << std::endl;
+                    
+                    // 然后读取数据
+                    size_t total_bytes_read = 0;
+                    for (auto& buffer : bufs) {
+                        size_t bytes_to_read = buffer.size();
+                        size_t bytes_read = 0;
+                        
+                        while (bytes_read < bytes_to_read) {
+                            size_t remaining = bytes_to_read - bytes_read;
+                            size_t n = co_await socket.async_read_some(
+                                asio::buffer(static_cast<char*>(buffer.data()) + bytes_read, remaining),
+                                asio::use_awaitable);
+                            bytes_read += n;
+                            total_bytes_read += n;
+                        }
+                    }
+                    
+                    std::cerr << "[D] Successfully received " << total_bytes_read << " bytes for request " << request_id << std::endl;
+
                 } catch (const std::exception &e) {
                     std::cerr << "[D] async_read FAILED:" << e.what() << std::endl;
-                    // 修复：避免在catch块内使用co_await
                     continue;
                 }
                 
-                std::cerr << "[D] Receive data from P-side. Buffers count=" << bufs.size() 
-                          << " first bytes=" << *(int64_t*)bufs[0].data()
-                          << std::endl;
-
                 global_stats_update(dst_ids.size() * bt.block_tp_size());
 
                 co_await upstream.async_send(
                     boost::system::error_code{}, std::make_tuple(request_id, dst_ids), asio::use_awaitable);
+                    
+                std::cerr << "[D] Completed request " << request_id << std::endl;
             }
         } catch (const std::exception &e) {
             std::cerr << "Connection " << addr.address() << ":" << addr.port() << " error: " << e.what() << "\n";
@@ -126,7 +138,7 @@ public:
     }
 
     asio::awaitable<void> submit_request(
-        std::string &request_id, table_id_t table_id, block_list_t &src_block_ids, block_list_t &dst_block_ids)
+        const std::string &request_id, table_id_t table_id, const block_list_t &src_block_ids, const block_list_t &dst_block_ids)
     {
         co_await request.async_send(boost::system::error_code{},
             std::make_tuple(request_id, table_id, src_block_ids, dst_block_ids),
@@ -141,7 +153,7 @@ private:
 
     BlockTable &bt;
     ConnectionChannel request;
-    ShardChannel &upstream;  // 恢复
+    ShardChannel &upstream;
 };
 
 static bool try_connect_once_with_timeout(const boost::asio::ip::tcp::endpoint &ep, std::chrono::seconds timeout)
@@ -210,7 +222,6 @@ public:
 
     asio::awaitable<void> gather(RequestMessage &req)
     {
-        // Completion tracking is based on dst ids.
         requests_mutex.lock();
         task_status[req.request_id] = std::set<block_id_t>(req.dst_block_ids.begin(), req.dst_block_ids.end());
         assert(task_status[req.request_id].size() == req.dst_block_ids.size());
@@ -253,7 +264,9 @@ public:
     asio::awaitable<void> run()
     {
         while (true) {
-            auto [request_id, ids] = co_await downstream.async_receive(asio::use_awaitable);
+            auto message = co_await downstream.async_receive(asio::use_awaitable);
+            auto request_id = std::get<0>(message);
+            auto ids = std::get<1>(message);
 
             requests_mutex.lock();
             for (auto id : ids) {
@@ -277,7 +290,7 @@ private:
     int last = 0;
     size_t conn_per_req = 4;
     boost::asio::ip::tcp::endpoint ip;
-    int rank;  // rank in the cluster
+    int rank;
     std::vector<std::shared_ptr<CoroutineConnection>> connections;
     std::unordered_map<std::string, std::set<block_id_t>> task_status;
 
@@ -291,8 +304,6 @@ public:
         : block_size(config.block_size), downstream(config.get_io_context(), 128), bt(bt), upstream(channel),
           merger(62, 128, 704, config.tp_size())
     {
-        // If Config exposes shard_clusters (multi-cluster), build per cluster;
-        // otherwise fall back to single cluster from flat shard_list.
         if (!config.shard_clusters.empty()) {
             clusters.reserve(config.shard_clusters.size());
             for (size_t c = 0; c < config.shard_clusters.size(); ++c) {
@@ -318,65 +329,10 @@ public:
         }
     }
 
-    asio::awaitable<void> merge_and_response(request_id_t request_id)
-    {
-        auto ex = co_await boost::asio::this_coro::executor;
-        std::vector<boost::asio::awaitable<void>> tasks;
-
-        requests_mutex.lock();
-        auto it = requests_status.find(request_id);
-        if (it == requests_status.end()) {
-            std::cout << "unexpected invalid request: " << request_id << std::endl;
-            requests_mutex.unlock();
-            co_return;
-        }
-        auto &[client_id, table_id, rank_finished, block_ids] = it->second;
-        requests_mutex.unlock();
-
-        bool failed = false;
-
-        for (auto block_id : block_ids) {
-            tasks.push_back(co_spawn(
-                ex,
-                [table_id, block_id, request_id, &failed, this]() -> boost::asio::awaitable<void> {
-                    void *ptr = bt.block_addr(table_id, block_id);
-
-                    void *buf = malloc(this->block_size);
-                    if (buf == nullptr) {
-                        failed = true;
-                        std::cout << "Failed allocate buffer: " << request_id << std::endl;
-                        co_return;
-                    }
-                    memcpy(buf, ptr, this->block_size);
-
-                    this->merger.merge_shards(static_cast<const short *>(buf), static_cast<short *>(ptr));
-                    free(buf);
-                    co_return;
-                },
-                boost::asio::use_awaitable));
-        }
-
-        for (auto &task : tasks) {
-            co_await std::move(task);
-        }
-
-        requests_mutex.lock();
-        client_id_t cid = client_id;
-        requests_status.erase(request_id);
-        requests_mutex.unlock();
-
-        // 修复：发送正确的4元素元组
-        co_await upstream.async_send(
-            boost::system::error_code{}, 
-            std::make_tuple(cid, request_id, -1, !failed),  // -1表示合并完成
-            asio::use_awaitable);
-    }
-
     asio::awaitable<void> run()
     {
         try {
             while (true) {
-                // 修复：正确的结构化绑定
                 auto message = co_await downstream.async_receive(asio::use_awaitable);
                 auto request_id = std::get<0>(message);
                 auto rank = std::get<1>(message);
@@ -397,10 +353,10 @@ public:
                     requests_status.erase(request_id);
                     requests_mutex.unlock();
 
-                    client_id_t cid = client_id;
+                    // 发送完成响应
                     co_await upstream.async_send(
                         boost::system::error_code{}, 
-                        std::make_tuple(cid, request_id, -1, true),  // -1表示所有分片完成
+                        std::make_tuple(client_id, request_id, -1, true),
                         asio::use_awaitable);
                 } else {
                     requests_mutex.unlock();
@@ -500,8 +456,6 @@ asio::awaitable<void> router_receiver(ZmqCoroutineSocket &router_socket, TPGroup
                 global_stats_update_running(1);
 
                 co_spawn(co_await asio::this_coro::executor, group.gather(client_id, request), detached);
-            } else {
-                // std::cout << "Wrong msg: " << msg->size() << std::endl;
             }
         } catch (const std::exception &e) {
             std::cerr << "Receiver error: " << e.what() << std::endl;
@@ -514,9 +468,6 @@ int main(int argc, char *argv[])
     try {
         Config config = parse_arguments(argc, argv);
         BlockTable bt(config);
-
-        block_list_t blocks = {0, 5, 11};
-        bt.get_buffers_layerwise(0, blocks, 1);
 
         asio::io_context &io_context = config.get_io_context();
 
@@ -565,5 +516,3 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-
-// g++ -std=c++20 -DNDEBUG -fcoroutines -I./ -g -march=native ox.cpp -o ox -lzmq -lpthread
