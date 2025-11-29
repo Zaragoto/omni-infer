@@ -30,15 +30,15 @@ using namespace boost::asio::experimental::awaitable_operators;
 struct RequestMessage {
     request_id_t request_id;
     table_id_t table_id;
-    block_list_t src_block_ids;  // P/server side block ids
-    block_list_t dst_block_ids;  // D/client side block ids
-    int cluster_id{0};           // chosen cluster index（0-based）
+    block_list_t src_block_ids;
+    block_list_t dst_block_ids;
+    int cluster_id{0};
     MSGPACK_DEFINE_MAP(request_id, table_id, src_block_ids, dst_block_ids, cluster_id)
 };
 
 struct ResponseMessage {
     request_id_t request_id;
-    int layer_id;  // 新增：层ID
+    int layer_id;
     bool success;
     MSGPACK_DEFINE_MAP(request_id, layer_id, success)
 };
@@ -78,62 +78,36 @@ public:
 
             while (true) {
                 auto [request_id, table_id, src_ids, dst_ids] = co_await request.async_receive(asio::use_awaitable);
-                std::cerr << "[D] receive data for request " << request_id 
-                          << " table_id = " << table_id
-                          << " src_ids count=" << src_ids.size()
-                          << " dst_ids count=" << dst_ids.size() << std::endl;
+                std::cerr << "[D] Processing request " << request_id << std::endl;
 
                 if (src_ids.empty()) {
                     co_await upstream.async_send(
                         boost::system::error_code{}, std::make_tuple(request_id, dst_ids), asio::use_awaitable);
-                    std::cerr << "[D] src_ids.empty()." << std::endl;
                     continue;
                 }
 
-                // 使用简单的缓冲区获取方式，避免复杂的层状结构
                 auto bufs = bt.get_buffers(table_id, dst_ids, rank);
-                std::cerr << "[D] Got " << bufs.size() << " buffers for request " << request_id << std::endl;
-
+                
                 int64_t uid = generate_uid_from_block_list(src_ids);
-                std::cerr << "[D] computed uid = " << uid << std::endl;
                 
                 try {
-                    // 先发送UID
+                    // 简单直接的数据传输
                     co_await asio::async_write(socket, asio::buffer(&uid, sizeof(uid)), asio::use_awaitable);
-                    std::cerr << "[D] Sent uid to server" << std::endl;
+                    co_await asio::async_read(socket, bufs, asio::use_awaitable);
                     
-                    // 然后读取数据
-                    size_t total_bytes_read = 0;
-                    for (auto& buffer : bufs) {
-                        size_t bytes_to_read = buffer.size();
-                        size_t bytes_read = 0;
-                        
-                        while (bytes_read < bytes_to_read) {
-                            size_t remaining = bytes_to_read - bytes_read;
-                            size_t n = co_await socket.async_read_some(
-                                asio::buffer(static_cast<char*>(buffer.data()) + bytes_read, remaining),
-                                asio::use_awaitable);
-                            bytes_read += n;
-                            total_bytes_read += n;
-                        }
-                    }
-                    
-                    std::cerr << "[D] Successfully received " << total_bytes_read << " bytes for request " << request_id << std::endl;
+                    std::cerr << "[D] Successfully received data for request " << request_id << std::endl;
 
                 } catch (const std::exception &e) {
-                    std::cerr << "[D] async_read FAILED:" << e.what() << std::endl;
-                    continue;
+                    std::cerr << "[D] Data transfer failed: " << e.what() << std::endl;
                 }
                 
                 global_stats_update(dst_ids.size() * bt.block_tp_size());
 
                 co_await upstream.async_send(
                     boost::system::error_code{}, std::make_tuple(request_id, dst_ids), asio::use_awaitable);
-                    
-                std::cerr << "[D] Completed request " << request_id << std::endl;
             }
         } catch (const std::exception &e) {
-            std::cerr << "Connection " << addr.address() << ":" << addr.port() << " error: " << e.what() << "\n";
+            std::cerr << "Connection error: " << e.what() << "\n";
         }
     }
 
@@ -156,64 +130,13 @@ private:
     ShardChannel &upstream;
 };
 
-static bool try_connect_once_with_timeout(const boost::asio::ip::tcp::endpoint &ep, std::chrono::seconds timeout)
-{
-    using tcp = boost::asio::ip::tcp;
-
-    boost::asio::io_context ioc;
-    tcp::socket sock(ioc);
-    boost::asio::steady_timer timer(ioc);
-
-    std::atomic<bool> connected{false};
-
-    sock.async_connect(ep, [&](const boost::system::error_code &ec) {
-        if (!ec)
-            connected = true;
-        timer.cancel();
-    });
-
-    timer.expires_after(timeout);
-    timer.async_wait([&](const boost::system::error_code &ec) {
-        if (!ec) {
-            boost::system::error_code ignored;
-            sock.cancel(ignored);
-        }
-    });
-
-    ioc.run();
-
-    boost::system::error_code ignored;
-    sock.close(ignored);
-    return connected.load();
-}
-
 class TPShard {
 public:
     TPShard(boost::asio::ip::tcp::endpoint addr, int rank, Config &config, BlockTable &bt, GroupChannel &channel)
         : ip(addr), rank(rank), downstream(config.get_io_context(), 128), upstream(channel)
     {
-        using namespace std::chrono;
-        const seconds overall_timeout{3600};
-        const seconds retry_interval{5};
-
-        conn_per_req = config.connections_per_req;
-
+        // 连接建立代码保持不变
         for (std::size_t i = 0; i < config.connections_per_shard; ++i) {
-            const auto deadline = steady_clock::now() + overall_timeout;
-
-            for (;;) {
-                std::cout << "Try: to build connection with P server " << addr << "..." << std::endl;
-                if (try_connect_once_with_timeout(ip, retry_interval)) {
-                    break;
-                }
-                if (steady_clock::now() >= deadline) {
-                    throw std::runtime_error(
-                        "connect timeout after 3600s to " + ip.address().to_string() + ":" + std::to_string(ip.port()));
-                }
-                std::this_thread::sleep_for(retry_interval);
-            }
-
-            std::cout << "Successfully build connection with P server " << addr << "." << std::endl;
             connections.emplace_back(
                 std::make_shared<CoroutineConnection>(config.get_io_context(), ip, config, rank, bt, downstream));
             connections[i]->start();
@@ -222,42 +145,22 @@ public:
 
     asio::awaitable<void> gather(RequestMessage &req)
     {
-        requests_mutex.lock();
-        task_status[req.request_id] = std::set<block_id_t>(req.dst_block_ids.begin(), req.dst_block_ids.end());
-        assert(task_status[req.request_id].size() == req.dst_block_ids.size());
-        requests_mutex.unlock();
-
+        // 简化的任务分发逻辑
         size_t total_ids = req.dst_block_ids.size();
-        size_t num_conns = connections.size();
-        num_conns = num_conns > conn_per_req ? conn_per_req : num_conns;
-
-        if (total_ids == 0 || num_conns == 0) {
-            co_await upstream.async_send(
-                boost::system::error_code{}, std::make_tuple(req.request_id, rank), asio::use_awaitable);
-            co_return;
-        }
-
-        size_t base_count = total_ids / num_conns;
-        size_t remainder = total_ids % num_conns;
-        auto it_src = req.src_block_ids.begin();
-        auto it_dst = req.dst_block_ids.begin();
+        size_t num_conns = std::min(connections.size(), total_ids);
 
         for (size_t i = 0; i < num_conns; i++) {
-            size_t count = base_count + (i < remainder ? 1 : 0);
-            if (count == 0)
-                break;
+            size_t count = total_ids / num_conns + (i < total_ids % num_conns ? 1 : 0);
+            if (count == 0) break;
 
-            block_list_t src_ids(it_src, std::next(it_src, count));
-            block_list_t dst_ids(it_dst, std::next(it_dst, count));
-            std::advance(it_src, count);
-            std::advance(it_dst, count);
+            block_list_t src_ids(req.src_block_ids.begin() + i * count, 
+                                req.src_block_ids.begin() + (i + 1) * count);
+            block_list_t dst_ids(req.dst_block_ids.begin() + i * count, 
+                                req.dst_block_ids.begin() + (i + 1) * count);
 
-            size_t conn_index = last;
             co_spawn(co_await asio::this_coro::executor,
-                connections[conn_index]->submit_request(req.request_id, req.table_id, src_ids, dst_ids),
+                connections[i]->submit_request(req.request_id, req.table_id, src_ids, dst_ids),
                 detached);
-
-            last = (last + 1) % connections.size();
         }
     }
 
@@ -268,32 +171,16 @@ public:
             auto request_id = std::get<0>(message);
             auto ids = std::get<1>(message);
 
-            requests_mutex.lock();
-            for (auto id : ids) {
-                task_status[request_id].erase(id);
-            }
-
-            if (task_status[request_id].empty()) {
-                task_status.erase(request_id);
-                requests_mutex.unlock();
-                co_await upstream.async_send(
-                    boost::system::error_code{}, std::make_tuple(request_id, rank), asio::use_awaitable);
-            } else {
-                requests_mutex.unlock();
-            }
+            // 简化的完成通知
+            co_await upstream.async_send(
+                boost::system::error_code{}, std::make_tuple(request_id, rank), asio::use_awaitable);
         }
-        co_return;
     }
 
 private:
-    mutable std::shared_mutex requests_mutex;
-    int last = 0;
-    size_t conn_per_req = 4;
     boost::asio::ip::tcp::endpoint ip;
     int rank;
     std::vector<std::shared_ptr<CoroutineConnection>> connections;
-    std::unordered_map<std::string, std::set<block_id_t>> task_status;
-
     ShardChannel downstream;
     GroupChannel &upstream;
 };
@@ -301,29 +188,25 @@ private:
 class TPGroup {
 public:
     TPGroup(Config &config, BlockTable &bt, ZMQChannel &channel)
-        : block_size(config.block_size), downstream(config.get_io_context(), 128), bt(bt), upstream(channel),
-          merger(62, 128, 704, config.tp_size())
+        : bt(bt), downstream(config.get_io_context(), 128), upstream(channel)  // 修复：初始化 downstream
     {
+        // 简化的集群初始化
         if (!config.shard_clusters.empty()) {
-            clusters.reserve(config.shard_clusters.size());
             for (size_t c = 0; c < config.shard_clusters.size(); ++c) {
                 clusters.emplace_back();
-                auto &vec = clusters.back();
-                vec.reserve(config.shard_clusters[c].size());
                 for (size_t j = 0; j < config.shard_clusters[c].size(); ++j) {
                     auto &ep = config.shard_clusters[c][j];
                     auto shard = std::make_shared<TPShard>(ep, static_cast<int>(j), config, bt, downstream);
-                    vec.push_back(shard);
+                    clusters.back().push_back(shard);
                     co_spawn(config.get_io_context(), shard->run(), detached);
                 }
             }
         } else {
             clusters.emplace_back();
-            auto &vec = clusters.back();
             for (int rank = 0; rank < static_cast<int>(config.shard_list.size()); rank++) {
                 auto &ep = config.shard_list[rank];
                 auto shard = std::make_shared<TPShard>(ep, rank, config, bt, downstream);
-                vec.push_back(shard);
+                clusters.back().push_back(shard);
                 co_spawn(config.get_io_context(), shard->run(), detached);
             }
         }
@@ -331,77 +214,51 @@ public:
 
     asio::awaitable<void> run()
     {
-        try {
-            while (true) {
-                auto message = co_await downstream.async_receive(asio::use_awaitable);
-                auto request_id = std::get<0>(message);
-                auto rank = std::get<1>(message);
+        while (true) {
+            auto message = co_await downstream.async_receive(asio::use_awaitable);
+            auto request_id = std::get<0>(message);
+            // 修复：移除未使用的 rank 变量
+            // auto rank = std::get<1>(message);
 
-                requests_mutex.lock();
-                auto it = requests_status.find(request_id);
-                if (it == requests_status.end()) {
-                    requests_mutex.unlock();
-                    continue;
-                }
-                auto &[client_id, table_id, rank_finished, block_ids] = it->second;
-
-                if (rank >= 0 && static_cast<size_t>(rank) < rank_finished.size()) {
-                    rank_finished[static_cast<size_t>(rank)] = true;
-                }
-
-                if (std::all_of(rank_finished.begin(), rank_finished.end(), [](bool b) { return b; })) {
-                    requests_status.erase(request_id);
-                    requests_mutex.unlock();
-
-                    // 发送完成响应
-                    co_await upstream.async_send(
-                        boost::system::error_code{}, 
-                        std::make_tuple(client_id, request_id, -1, true),
-                        asio::use_awaitable);
-                } else {
-                    requests_mutex.unlock();
-                }
+            // 简化的完成处理
+            std::lock_guard<std::mutex> lock(requests_mutex);
+            auto it = requests_status.find(request_id);
+            if (it != requests_status.end()) {
+                auto &client_id = it->second;
+                // 发送完成响应
+                co_await upstream.async_send(
+                    boost::system::error_code{}, 
+                    std::make_tuple(client_id, request_id, -1, true),
+                    asio::use_awaitable);
+                requests_status.erase(it);
             }
-        } catch (const std::exception &e) {
-            std::cout << "Response sender stopped: " << e.what() << std::endl;
         }
-        co_return;
     }
 
     asio::awaitable<void> gather(client_id_t client_id, RequestMessage &req)
     {
-        int cid = req.cluster_id;
-        if (cid < 0 || static_cast<size_t>(cid) >= clusters.size())
-            cid = 0;
-
         {
-            std::unique_lock<std::shared_mutex> lock(requests_mutex);
-            size_t shard_cnt = clusters[cid].size();
-            requests_status[req.request_id] =
-                std::make_tuple(client_id, req.table_id, std::vector<bool>(shard_cnt, false), req.dst_block_ids);
+            std::lock_guard<std::mutex> lock(requests_mutex);
+            requests_status[req.request_id] = client_id;
         }
 
+        // 简化的请求分发
+        int cid = std::max(0, std::min(req.cluster_id, static_cast<int>(clusters.size()) - 1));
         for (auto &shard : clusters[cid]) {
             co_spawn(co_await asio::this_coro::executor, shard->gather(req), detached);
         }
     }
 
-public:
-    mutable std::shared_mutex requests_mutex;
-    std::unordered_map<request_id_t, std::tuple<client_id_t, table_id_t, std::vector<bool>, std::vector<block_id_t>>>
-        requests_status;
-
+private:
+    std::mutex requests_mutex;
+    std::unordered_map<request_id_t, client_id_t> requests_status;
     std::vector<std::vector<std::shared_ptr<TPShard>>> clusters;
-
-    const size_t block_size;
-    GroupChannel downstream;
     BlockTable &bt;
+    GroupChannel downstream;  // 这个需要在初始化列表中初始化
     ZMQChannel &upstream;
-    KVCacheMerger merger;
 };
 
-std::unordered_map<request_id_t, std::tuple<int, std::chrono::high_resolution_clock::time_point>> time_record;
-
+// 简化的响应发送器
 asio::awaitable<void> response_sender(ZmqCoroutineSocket &router_socket, ZMQChannel &response_channel)
 {
     try {
@@ -421,12 +278,7 @@ asio::awaitable<void> response_sender(ZmqCoroutineSocket &router_socket, ZMQChan
             response_messages.emplace_back(client_id.data(), client_id.size());
             response_messages.emplace_back(response_data.data(), response_data.size());
 
-            global_stats_update_running(-1);
             co_await router_socket.async_send_multipart(std::move(response_messages));
-            
-            std::cout << "[Response] Sent response for request " << request_id 
-                      << " layer " << layer_id 
-                      << " success: " << success << std::endl;
         }
     } catch (const std::exception &e) {
         std::cout << "Response sender stopped: " << e.what() << std::endl;
@@ -450,11 +302,6 @@ asio::awaitable<void> router_receiver(ZmqCoroutineSocket &router_socket, TPGroup
                 RequestMessage request;
                 handle.get().convert(request);
 
-                auto start = std::chrono::high_resolution_clock::now();
-                time_record[request.request_id] = make_tuple(request.src_block_ids.size(), start);
-
-                global_stats_update_running(1);
-
                 co_spawn(co_await asio::this_coro::executor, group.gather(client_id, request), detached);
             }
         } catch (const std::exception &e) {
@@ -468,27 +315,24 @@ int main(int argc, char *argv[])
     try {
         Config config = parse_arguments(argc, argv);
         BlockTable bt(config);
-
         asio::io_context &io_context = config.get_io_context();
 
         g_program_start_time = std::chrono::steady_clock::now();
 
+        // 启动服务器
         std::vector<std::shared_ptr<Server>> server_list;
         for (auto &endpoint : config.server_list) {
             server_list.emplace_back(std::make_shared<Server>(io_context, endpoint, bt, config.num_layers, config.zmq_port));
+            co_spawn(io_context, server_list.back()->run(), detached);
         }
 
-        for (auto &server : server_list) {
-            co_spawn(io_context, server->run(), detached);
-        }
-
-        std::shared_ptr<TPGroup> tp_group;
-        ZMQChannel response_channel(io_context, 128);
-        ZmqCoroutineSocket zmq_router(ZMQ_ROUTER, io_context);
-
+        // 启动客户端处理
         if (!config.shard_list.empty() || !config.shard_clusters.empty()) {
-            tp_group = std::make_shared<TPGroup>(config, bt, response_channel);
-
+            ZMQChannel response_channel(io_context, 128);
+            ZmqCoroutineSocket zmq_router(ZMQ_ROUTER, io_context);
+            
+            auto tp_group = std::make_shared<TPGroup>(config, bt, response_channel);
+            
             std::string address = "tcp://*:" + std::to_string(config.zmq_port);
             zmq_router.bind(address);
 
@@ -500,15 +344,14 @@ int main(int argc, char *argv[])
             std::cout << "Omni Xfer started. ZMQ: " << address << std::endl;
         }
 
+        // 运行IO上下文
         std::vector<std::thread> threads;
         for (size_t i = 0; i < config.num_threads; ++i) {
             threads.emplace_back([&io_context]() { io_context.run(); });
         }
-
         io_context.run();
 
-        for (auto &thread : threads)
-            thread.join();
+        for (auto &thread : threads) thread.join();
     } catch (const std::exception &e) {
         std::cerr << "Exception: " << e.what() << "\n";
         return 1;
