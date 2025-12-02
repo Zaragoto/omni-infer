@@ -23,8 +23,6 @@ import msgpack
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-from omni.accelerators.cache.omni_cache import BaseOmniCache
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
@@ -927,6 +925,8 @@ class DecodeConnectorScheduler:
 class DecodeConnectorWorker:
     """Worker implementation for datadist (decode)."""
 
+    _h2d_wait = threading.Event()
+
     def __init__(self, vllm_config: "VllmConfig", host_ip: str, cluster_id_start: int):
         self.vllm_config = vllm_config
         self.cluster_id_start = cluster_id_start
@@ -960,7 +960,7 @@ class DecodeConnectorWorker:
         max_concurrents = 1
         self.executor = ThreadPoolExecutor(max_workers=max_concurrents)
 
-        self.omni_cache: BaseOmniCache = None
+        self.omni_cache = None
 
         if self.async_pull_kv:
             thread_name = f"async_pull_kv_{self.dp_rank}"
@@ -1172,7 +1172,7 @@ class DecodeConnectorWorker:
             "request_id": request_id,
             "cluster_id": int(dst_cluster_id),
             "src_id_list": remote_block_ids,
-            "dst_id_list": local_block_ids[1],
+            "dst_id_list": local_block_ids[0],
             "rank_id": self.omni_cache.dp_local_rank,
         }
         logger.warning("\n========== PY FINAL SENT TO OX ==========")
