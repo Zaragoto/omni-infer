@@ -61,7 +61,7 @@ from omni.adaptors.vllm.utils import get_attr_by_names
 if os.environ.get("ENABLE_OMNI_CACHE", "0") == "1":
     FLAG_OMNI_CACHE = True
     if os.environ.get("ENABLE_D_SIDE_FIRST", "0") == "1":
-        from omni.accelerators.pd.omni_cache_connector_d2p import decode_h2d_trigger
+        from omni.accelerators.pd.omni_cache_connector_v2 import decode_h2d_trigger
     else:
         from omni.accelerators.pd.omni_cache_connector_v1 import decode_h2d_trigger
 else:
