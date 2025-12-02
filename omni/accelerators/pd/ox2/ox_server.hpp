@@ -27,6 +27,7 @@ using asio::detached;
 using asio::use_awaitable;
 using asio::experimental::concurrent_channel;
 using asio::ip::tcp;
+using namespace boost::asio::experimental::awaitable_operators;
 
 struct ZmqCmd {
     table_id_t table_id = 0;
@@ -135,7 +136,6 @@ private:
                     std::lock_guard<std::mutex> req_lock(req_ptr->req_mutex);
 
                     for (auto &[layer_id, state] : req_ptr->layer_states) {
-                        // 检查上一层是否已发送
                         if (layer_id > 0) {
                             auto it_prev = req_ptr->layer_states.find(layer_id - 1);
                             if (it_prev == req_ptr->layer_states.end() || !it_prev->second.sent) {
@@ -146,37 +146,20 @@ private:
                         if (!state.sent)
                             all_sent = false;
 
-                        // 简化发送逻辑：直接发送，不检查复杂状态
+                        // 修复：确保状态正确且没有正在发送
                         if (state.ready && !state.sent && state.need && !state.sending && !state.buffers.empty()) {
-                            std::cerr << "[Server] Sending layer " << layer_id << " for uid " << uid 
-                                      << " with " << state.buffers.size() << " buffers" << std::endl;
+                            std::cerr << "[Server] Sending layer " << layer_id << " for uid " << uid << std::endl;
                             
                             state.sending = true;
                             
-                            // 直接发送，不异步
-                            try {
-                                for (const auto& buffer : state.buffers) {
-                                    size_t bytes_to_send = buffer.size();
-                                    size_t bytes_sent = 0;
-                                    
-                                    while (bytes_sent < bytes_to_send) {
-                                        size_t remaining = bytes_to_send - bytes_sent;
-                                        size_t n = co_await asio::async_write(socket_, 
-                                            asio::buffer(static_cast<const char*>(buffer.data()) + bytes_sent, remaining),
-                                            asio::use_awaitable);
-                                        bytes_sent += n;
-                                    }
-                                }
-                                
-                                std::cerr << "[Server] Successfully sent layer " << layer_id << std::endl;
-                                state.sent = true;
-                                state.sending = false;
-                                state.need = false;
-                                
-                            } catch (const std::exception& e) {
-                                std::cerr << "[Server] Failed to send layer " << layer_id << ": " << e.what() << std::endl;
-                                state.sending = false;
-                            }
+                            // 使用co_spawn避免阻塞发送循环
+                            co_spawn(
+                                executor,
+                                [self = shared_from_this(), state_ptr = &state, layer_id = layer_id, uid = uid]() -> asio::awaitable<void> {
+                                    co_await state_ptr->send(self->socket_, layer_id);
+                                },
+                                asio::detached
+                            );
                         }
                     }
 
@@ -298,8 +281,11 @@ public:
                 }
             } catch (const std::exception& e) {
                 std::cerr << "[Session ZMQ] listener exception: " << e.what() << std::endl;
+                // 修复：避免在catch块内使用co_await
                 asio::steady_timer timer(io_context_, std::chrono::milliseconds(1));
-                timer.async_wait([this](boost::system::error_code) {});
+                timer.async_wait([this](boost::system::error_code) {
+                    // 继续处理
+                });
             }
         }
     }
@@ -338,14 +324,17 @@ private:
                 std::lock_guard<std::mutex> lock(new_req->req_mutex);
                 auto& target_layer = new_req->layer_states[task.cmd.layer_id];
                 target_layer.ready = true;
-                // 现在可以传递 const block_list_t
-                target_layer.buffers = bt_.get_buffers(
+                target_layer.buffers = bt_.get_buffers_one_layer(
                     /*table_id*/ 0,
-                    /*block_list*/ task.cmd.block_ids,  // 这是 const，现在可以传递
-                    /*rank*/ 0);
+                    /*block_list*/ task.cmd.block_ids,
+                    /*rank*/ 0,
+                    /*layer_id*/ task.cmd.layer_id);
                     
-                std::cerr << "[Server]: got " << target_layer.buffers.size() 
-                          << " buffers for layer " << task.cmd.layer_id << std::endl;
+                if (!target_layer.buffers.empty()) {
+                    std::cerr << "[Server]: get buffers of layer " << task.cmd.layer_id << std::endl;
+                } else {
+                    std::cerr << "[Server]: empty buffers of layer " << task.cmd.layer_id << std::endl;
+                }
             }
             
             add_request(new_req);
@@ -353,13 +342,17 @@ private:
             std::lock_guard<std::mutex> lock(req->req_mutex);
             auto& target_layer = req->layer_states[task.cmd.layer_id];
             if (!target_layer.ready) {
-                target_layer.buffers = bt_.get_buffers(
+                target_layer.buffers = bt_.get_buffers_one_layer(
                     /*table_id*/ 0,
-                    /*block_list*/ task.cmd.block_ids,  // 这是 const，现在可以传递
-                    /*rank*/ 0);
+                    /*block_list*/ task.cmd.block_ids,
+                    /*rank*/ 0,
+                    /*layer_id*/ task.cmd.layer_id);
                     
-                std::cerr << "[Server]: got " << target_layer.buffers.size() 
-                          << " buffers for layer " << task.cmd.layer_id << std::endl;
+                if (!target_layer.buffers.empty()) {
+                    std::cerr << "[Server]: get buffers of layer " << task.cmd.layer_id << std::endl;
+                } else {
+                    std::cerr << "[Server]: empty buffers of layer " << task.cmd.layer_id << std::endl;
+                }
                 target_layer.ready = true;
             }
         }

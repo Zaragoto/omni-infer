@@ -135,8 +135,7 @@ public:
         return static_cast<char *>(block_addr(table_id, block_id)) + block_tp_size() * rank;
     }
 
-    // 修改：添加 const 版本
-    std::vector<boost::asio::mutable_buffer> get_buffers(table_id_t table_id, const block_list_t &block_ids, int rank)
+    std::vector<boost::asio::mutable_buffer> get_buffers(table_id_t table_id, block_list_t &block_ids, int rank)
     {
         std::vector<boost::asio::mutable_buffer> buffers;
         buffers.reserve(block_ids.size());
@@ -147,7 +146,6 @@ public:
         return buffers;
     }
 
-    // 修改：添加 const 版本
     std::vector<boost::asio::mutable_buffer> get_buffers_one_layer(
         table_id_t table_id, const block_list_t &block_ids, int rank, size_t layer_id)
     {
@@ -155,6 +153,7 @@ public:
         size_t tp_size = config.tp_size();
 
         std::vector<boost::asio::mutable_buffer> buffers;
+        // buffers.reserve(blocks.size() * block_ids.size());
 
         for(size_t i = 0; i < blocks.size(); ++i) {
             char *base = ptr + block_offset[i];
@@ -168,9 +167,8 @@ public:
         return buffers;
     }
 
-    // 修改：添加 const 版本  
     std::vector<boost::asio::mutable_buffer> get_buffers_layerwise(table_id_t table_id,
-                                  const block_list_t &block_ids,
+                                  block_list_t &block_ids,
                                   int rank)
     {
         char *ptr = table_addr(table_id);
@@ -206,9 +204,35 @@ public:
         return buffers;
     }
 
-    // 修改：添加 const 版本
+
+    /*
+    std::vector<boost::asio::mutable_buffer> get_buffers_layerwise(
+        table_id_t table_id, block_list_t &block_ids, int rank)
+    {
+        char *ptr = table_addr(table_id);
+        size_t tp_size = config.tp_size();
+
+        std::vector<boost::asio::mutable_buffer> buffers;
+        for (auto block_id : block_ids) {
+            for (size_t i = 0; i < blocks.size(); i++) {  // blocks: ..512, ..64, ..128
+                char *base = ptr + block_offset[i];
+                for (size_t j = 0; j < blocks[i][0]; j++) {  // layers
+                    void *layer = base + j * layer_size[i] + block_id * block_layer_size[i] +
+                                  (block_layer_size[i] * rank) / tp_size;
+                    buffers.emplace_back(layer, block_layer_size[i] / tp_size);
+                    // std::cout << "block id: " << block_id << " segment: " << i << " layer: " << j
+                    //           << " addr: " << (((char *)layer) - ptr) << " size:" << block_layer_size[i] / tp_size
+                    //           << std::endl;
+                }
+            }
+        }
+
+        return buffers;
+    }
+    */
+
     std::vector<boost::asio::mutable_buffer> get_buffers_interleaved(
-        table_id_t table_id, const block_list_t &block_ids, int rank)
+        table_id_t table_id, block_list_t &block_ids, int rank)
     {
         std::vector<boost::asio::mutable_buffer> buffers;
         size_t num_layers = 62;
@@ -242,6 +266,101 @@ public:
             }
         }
         return buffers;
+    }
+
+    // inline size_t block_L_count(size_t D_dim) const {
+    //     assert(D_dim > 0);
+    //     assert(config.block_size % D_dim == 0);
+    //     return config.block_size / D_dim;
+    // }
+
+    // inline size_t block_rank_slice_size(size_t D_dim) const {
+    //     assert(config.tp_size() > 0);
+    //     assert(D_dim % static_cast<size_t>(config.tp_size()) == 0);
+    //     return D_dim / static_cast<size_t>(config.tp_size());
+    // }
+
+    // std::vector<boost::asio::mutable_buffer>
+    // get_buffers(table_id_t table_id, block_list_t& block_ids, int rank, size_t D_dim)
+    // {
+    //     std::vector<boost::asio::mutable_buffer> buffers;
+
+    //     const size_t L = block_L_count(D_dim);
+    //     const size_t slice_sz = block_rank_slice_size(D_dim);
+
+    //     buffers.reserve(block_ids.size() * L);
+
+    //     for (auto id : block_ids) {
+    //         char* block_start = static_cast<char*>(block_addr(table_id, static_cast<size_t>(id)));
+
+    //         for (size_t l = 0; l < L; ++l) {
+    //             char* chunk_start = block_start + l * D_dim;
+    //             char* rank_chunk_start = chunk_start + rank * slice_sz;
+
+    //             assert(rank_chunk_start >= static_cast<char*>(base));
+    //             assert(rank_chunk_start + slice_sz <= static_cast<char*>(base) + map_size);
+
+    //             buffers.emplace_back(rank_chunk_start, slice_sz);
+    //         }
+    //     }
+    //     return buffers;
+    // }
+
+private:
+    //     static bool try_mlock_onfault(void* addr, size_t len) {
+    // // #if defined(__linux__) && defined(MLOCK_ONFAULT)
+    //         return (::mlock2(addr, len, MLOCK_ONFAULT) == 0);
+    // // #else
+    // //         (void)addr; (void)len; return false;
+    // // #endif
+    //     }
+
+    static void mlock_in_chunks(void *addr, size_t len, size_t chunk = (64ULL << 20))
+    {
+        auto *p = static_cast<unsigned char *>(addr);
+        for (size_t off = 0; off < len; off += chunk) {
+            size_t now = std::min(chunk, len - off);
+            if (::mlock(p + off, now) != 0) {
+            }
+        }
+    }
+
+    bool try_become_mlock_leader_by_fd(int fd_)
+    {
+        struct flock fl {};
+        fl.l_type = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start = 0;
+        fl.l_len = 1;
+        return (::fcntl(fd_, F_SETLK, &fl) == 0);
+    }
+
+    void maybe_pin_as_leader()
+    {
+        if (fd < 0)
+            return;
+
+        constexpr int kRetries = 50;
+        constexpr int kSleepMs = 20;
+        for (int i = 0; i < kRetries; ++i) {
+            if (try_become_mlock_leader_by_fd(fd)) {
+                is_leader_ = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(kSleepMs));
+        }
+
+        if (!is_leader_) {
+            return;
+        }
+
+        // if (try_mlock_onfault(base, map_size)) {
+        //     did_pin_ = true;
+        //     return;
+        // }
+
+        mlock_in_chunks(base, map_size, 64ULL << 20);
+        did_pin_ = true;
     }
 
 private:
@@ -281,11 +400,11 @@ private:
 
     void open_from_file_or_fallback_shm(const std::string &filepath)
     {
-        std::string base_name = basename_of(filepath);
-        if (base_name.empty()) {
+        std::string base = basename_of(filepath);
+        if (base.empty()) {
             throw std::system_error(EINVAL, std::generic_category(), "invalid path for deriving shm name");
         }
-        std::string shm_name = "/" + base_name;
+        std::string shm_name = "/" + base;
 
         open_file_backed(filepath);
     }
@@ -352,50 +471,6 @@ private:
             fd = -1;
             throw std::system_error(e, std::generic_category(), "mmap failed");
         }
-    }
-
-    static void mlock_in_chunks(void *addr, size_t len, size_t chunk = (64ULL << 20))
-    {
-        auto *p = static_cast<unsigned char *>(addr);
-        for (size_t off = 0; off < len; off += chunk) {
-            size_t now = std::min(chunk, len - off);
-            if (::mlock(p + off, now) != 0) {
-                // Ignore errors for now
-            }
-        }
-    }
-
-    bool try_become_mlock_leader_by_fd(int fd_)
-    {
-        struct flock fl {};
-        fl.l_type = F_WRLCK;
-        fl.l_whence = SEEK_SET;
-        fl.l_start = 0;
-        fl.l_len = 1;
-        return (::fcntl(fd_, F_SETLK, &fl) == 0);
-    }
-
-    void maybe_pin_as_leader()
-    {
-        if (fd < 0)
-            return;
-
-        constexpr int kRetries = 50;
-        constexpr int kSleepMs = 20;
-        for (int i = 0; i < kRetries; ++i) {
-            if (try_become_mlock_leader_by_fd(fd)) {
-                is_leader_ = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(kSleepMs));
-        }
-
-        if (!is_leader_) {
-            return;
-        }
-
-        mlock_in_chunks(base, map_size, 64ULL << 20);
-        did_pin_ = true;
     }
 
 private:
