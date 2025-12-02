@@ -38,12 +38,11 @@ struct RequestMessage {
 
 struct ResponseMessage {
     request_id_t request_id;
-    int layer_id;  // 新增：层ID
     bool success;
-    MSGPACK_DEFINE_MAP(request_id, layer_id, success)
+    MSGPACK_DEFINE_MAP(request_id, success)
 };
 
-using ResponseTask = std::tuple<client_id_t, request_id_t, int, bool>;  // 修改：增加layer_id
+using ResponseTask = std::tuple<client_id_t, request_id_t, bool>;
 using ZMQChannel = concurrent_channel<asio::any_io_executor, void(boost::system::error_code, ResponseTask)>;
 
 using ConnectionMessage = std::tuple<request_id_t, table_id_t, block_list_t, block_list_t>;
@@ -58,9 +57,9 @@ using GroupChannel = concurrent_channel<asio::any_io_executor, void(boost::syste
 class CoroutineConnection {
 public:
     CoroutineConnection(asio::io_context &io_context, boost::asio::ip::tcp::endpoint addr, Config &config, int rank,
-        BlockTable &bt, ShardChannel &response)  // 恢复使用ShardChannel
+        BlockTable &bt, ShardChannel &response)
         : socket(io_context), config(config), rank(rank), addr(addr), bt(bt), request(config.get_io_context(), 128),
-          upstream(response)  // 恢复upstream
+          upstream(response)
     {}
 
     void start()
@@ -73,8 +72,10 @@ public:
         try {
             co_await socket.async_connect(addr, asio::use_awaitable);
             optimize_tcp_socket(socket);
+            // Log: Successful connection
             std::cerr << "[D_SIDE_CONN] INFO: Successfully connected to P-side shard at " << addr.address() << ":"
                       << addr.port() << "\n";
+
 
             while (true) {
                 std::cerr << "[D_SIDE_CONN] while ..." << std::endl;
@@ -84,41 +85,67 @@ public:
                           << std::endl;
 
                 if (src_ids.empty()) {
+                    // no task, return empty immediately
                     co_await upstream.async_send(
                         boost::system::error_code{}, std::make_tuple(request_id, dst_ids), asio::use_awaitable);
                     std::cerr << "[D] src_ids.empty()." << std::endl;
                     continue;
                 }
 
+                // Target buffer follows dst_ids; send src_ids to P-side server.
+                // auto bufs = bt.get_buffers(table_id, dst_ids, rank);
+
+                // auto bufs = bt.get_buffers_interleaved(table_id, dst_ids, rank);
                 auto bufs = bt.get_buffers_layerwise(table_id, dst_ids, rank);
                 
+                // for (auto id : src_ids) {
+                //     std::cout << "Request for ID:" << id << std::endl;
+                // }
+                // for (auto id : dst_ids) {
+                //     std::cout << "Save to ID:" << id << std::endl;
+                // }
+                // std::cout << "Buf size:" << bufs.size()/dst_ids.size() << std::endl;
+
+
                 for (block_id_t id : src_ids) {
-                    std::cout << id << " ";
-                }
+                        std::cout << id << " ";
+                    }
                 std::cout << std::endl;
 
                 int64_t uid = generate_uid_from_block_list(src_ids);
                 std::cerr << "[D] computed uid = " << uid << std::endl;
                 
                 try {
-                    co_await (asio::async_write(socket,
-                                  asio::buffer(&uid, sizeof(uid)),
-                                  asio::use_awaitable) &&
-                              asio::async_read(socket, bufs, asio::use_awaitable));
-                } catch (const std::exception &e) {
-                    std::cerr << "[D] async_read FAILED:" << e.what() << std::endl;
-                    // 修复：避免在catch块内使用co_await
-                    continue;
-                }
+                // co_await asio::async_write(socket, asio::buffer(&uid, sizeof(uid)), asio::use_awaitable);
+                // co_await asio::async_read(socket, bufs, asio::use_awaitable);
+                co_await (asio::async_write(socket,
+                              asio::buffer(&uid, sizeof(uid)),
+                              asio::use_awaitable) &&
+                          asio::async_read(socket, bufs, asio::use_awaitable));
+                }catch (const std::exception &e) {
+                std::cerr << "[D] async_read FAILED:" << e.what() << std::endl;
+            }
+                
                 
                 std::cerr << "[D] Receive data from P-side. Buffers count=" << bufs.size() 
                           << " first bytes=" << *(int64_t*)bufs[0].data()
                           << std::endl;
 
+                // #ifdef CONTENT_CHECK
+                //                 for (size_t i = 0; i < src_ids.size(); i++)
+                //                 {
+                //                     int64_t *data = static_cast<int64_t *>(bufs[i].data());
+                //                     std::cerr << "Check content: " << *data << " : " << src_ids[i] << "\n";
+                //                     assert(*data == src_ids[i]);
+                //                 }
+                // #endif
+
                 global_stats_update(dst_ids.size() * bt.block_tp_size());
 
+                // return finished dst_ids
                 co_await upstream.async_send(
                     boost::system::error_code{}, std::make_tuple(request_id, dst_ids), asio::use_awaitable);
+                
             }
         } catch (const std::exception &e) {
             std::cerr << "Connection " << addr.address() << ":" << addr.port() << " error: " << e.what() << "\n";
@@ -141,7 +168,7 @@ private:
 
     BlockTable &bt;
     ConnectionChannel request;
-    ShardChannel &upstream;  // 恢复
+    ShardChannel &upstream;
 };
 
 static bool try_connect_once_with_timeout(const boost::asio::ip::tcp::endpoint &ep, std::chrono::seconds timeout)
@@ -341,6 +368,7 @@ public:
                 [table_id, block_id, request_id, &failed, this]() -> boost::asio::awaitable<void> {
                     void *ptr = bt.block_addr(table_id, block_id);
 
+                    // auto start = std::chrono::high_resolution_clock::now();
                     void *buf = malloc(this->block_size);
                     if (buf == nullptr) {
                         failed = true;
@@ -349,8 +377,13 @@ public:
                     }
                     memcpy(buf, ptr, this->block_size);
 
+                    // auto duration1 =
+                    // std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() -
+                    // start).count(); auto ms =
+                    // std::chrono::duration_cast<std::chrono::milliseconds>(end.time_since_epoch()).count();
                     this->merger.merge_shards(static_cast<const short *>(buf), static_cast<short *>(ptr));
                     free(buf);
+                    // std::cout << pthread_self() << std::endl;
                     co_return;
                 },
                 boost::asio::use_awaitable));
@@ -365,22 +398,18 @@ public:
         requests_status.erase(request_id);
         requests_mutex.unlock();
 
-        // 修复：发送正确的4元素元组
         co_await upstream.async_send(
-            boost::system::error_code{}, 
-            std::make_tuple(cid, request_id, -1, !failed),  // -1表示合并完成
-            asio::use_awaitable);
+            boost::system::error_code{}, std::make_tuple(cid, request_id, !failed), asio::use_awaitable);
     }
 
     asio::awaitable<void> run()
     {
         try {
             while (true) {
-                // 修复：正确的结构化绑定
-                auto message = co_await downstream.async_receive(asio::use_awaitable);
-                auto request_id = std::get<0>(message);
-                auto rank = std::get<1>(message);
+                auto [request_id, rank] = co_await downstream.async_receive(asio::use_awaitable);
 
+                // rank is the index within the cluster;
+                // the corresponding bit in the cluster's completion bitmap was already set when the request was logged.
                 requests_mutex.lock();
                 auto it = requests_status.find(request_id);
                 if (it == requests_status.end()) {
@@ -393,15 +422,19 @@ public:
                     rank_finished[static_cast<size_t>(rank)] = true;
                 }
 
+                // std::cout << "Finished to pull kv for request " << request_id << " from TP-rank-" << rank <<
+                // std::endl;
+
                 if (std::all_of(rank_finished.begin(), rank_finished.end(), [](bool b) { return b; })) {
                     requests_status.erase(request_id);
                     requests_mutex.unlock();
 
                     client_id_t cid = client_id;
+                    // std::cout << "Send response: " << request_id << std::endl;
                     co_await upstream.async_send(
-                        boost::system::error_code{}, 
-                        std::make_tuple(cid, request_id, -1, true),  // -1表示所有分片完成
-                        asio::use_awaitable);
+                        boost::system::error_code{}, std::make_tuple(cid, request_id, true), asio::use_awaitable);
+                    // requests_mutex.unlock();
+                    // co_spawn(co_await asio::this_coro::executor, merge_and_response(request_id), detached);
                 } else {
                     requests_mutex.unlock();
                 }
@@ -414,17 +447,20 @@ public:
 
     asio::awaitable<void> gather(client_id_t client_id, RequestMessage &req)
     {
+        // Select cluster; fall back to 0 if out-of-bounds.
         int cid = req.cluster_id;
         if (cid < 0 || static_cast<size_t>(cid) >= clusters.size())
             cid = 0;
 
         {
             std::unique_lock<std::shared_mutex> lock(requests_mutex);
+            // Size the completion bitmap to the number of shards in the selected cluster.
             size_t shard_cnt = clusters[cid].size();
             requests_status[req.request_id] =
                 std::make_tuple(client_id, req.table_id, std::vector<bool>(shard_cnt, false), req.dst_block_ids);
         }
 
+        // Send requests only to the shards of the selected cluster.
         for (auto &shard : clusters[cid]) {
             co_spawn(co_await asio::this_coro::executor, shard->gather(req), detached);
         }
@@ -432,9 +468,11 @@ public:
 
 public:
     mutable std::shared_mutex requests_mutex;
+    // request_id → (client_id, completion bitmap [within cluster])
     std::unordered_map<request_id_t, std::tuple<client_id_t, table_id_t, std::vector<bool>, std::vector<block_id_t>>>
         requests_status;
 
+    // clusters[c] holds the TPShard instances within that cluster.
     std::vector<std::vector<std::shared_ptr<TPShard>>> clusters;
 
     const size_t block_size;
@@ -450,13 +488,9 @@ asio::awaitable<void> response_sender(ZmqCoroutineSocket &router_socket, ZMQChan
 {
     try {
         while (true) {
-            auto message = co_await response_channel.async_receive(asio::use_awaitable);
-            auto client_id = std::get<0>(message);
-            auto request_id = std::get<1>(message);
-            auto layer_id = std::get<2>(message);
-            auto success = std::get<3>(message);
+            auto [client_id, request_id, success] = co_await response_channel.async_receive(asio::use_awaitable);
 
-            ResponseMessage response = {request_id, layer_id, success};
+            ResponseMessage response = {request_id, success};
             std::stringstream buffer;
             msgpack::pack(buffer, response);
             std::string response_data = buffer.str();
@@ -465,12 +499,19 @@ asio::awaitable<void> response_sender(ZmqCoroutineSocket &router_socket, ZMQChan
             response_messages.emplace_back(client_id.data(), client_id.size());
             response_messages.emplace_back(response_data.data(), response_data.size());
 
+            // auto [num_ids, start] = time_record[request_id];
+            // auto end = std::chrono::high_resolution_clock::now();
+            // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+            // auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end.time_since_epoch()).count();
+
+            // std::cout << "Finished: " << request_id
+            //           << "Num blocks: " << num_ids
+            //           << " Duration:" << duration << " ms"
+            //           << " per block:" << ((float)duration * 1.0) / (num_ids * 1.0)
+            //              << " End: " << ms << std::endl;
             global_stats_update_running(-1);
             co_await router_socket.async_send_multipart(std::move(response_messages));
-            
-            std::cout << "[Response] Sent response for request " << request_id 
-                      << " layer " << layer_id 
-                      << " success: " << success << std::endl;
         }
     } catch (const std::exception &e) {
         std::cout << "Response sender stopped: " << e.what() << std::endl;
@@ -497,6 +538,7 @@ asio::awaitable<void> router_receiver(ZmqCoroutineSocket &router_socket, TPGroup
                 auto start = std::chrono::high_resolution_clock::now();
                 time_record[request.request_id] = make_tuple(request.src_block_ids.size(), start);
 
+                // std::cout << "Start to pull kv for request " << request.request_id << std::endl;
                 global_stats_update_running(1);
 
                 co_spawn(co_await asio::this_coro::executor, group.gather(client_id, request), detached);
@@ -566,4 +608,4 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-// g++ -std=c++20 -DNDEBUG -fcoroutines -I./ -g -march=native ox.cpp -o ox -lzmq -lpthread
+// g++ -std=c++20 -DNDEBUG -fcoroutines -I./  -g -march=native  ox.cpp -o ox -lzmq -lpthread

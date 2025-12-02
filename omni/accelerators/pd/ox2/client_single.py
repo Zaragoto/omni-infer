@@ -27,23 +27,11 @@ class RouterDealerClient:
             print(f"[ERROR] Failed to send: {e}")
             return False
 
-    def receive_response(self, timeout_ms=10000):
-        """接收响应，支持超时"""
+    def receive_response(self):
         try:
-            self.socket.RCVTIMEO = timeout_ms
             frames = self.socket.recv_multipart()
-            responses = []
-            for f in frames:
-                try:
-                    resp = msgpack.unpackb(f)
-                    responses.append(resp)
-                except:
-                    # 如果不是msgpack数据，可能是身份帧
-                    pass
+            responses = [msgpack.unpackb(f) for f in frames]
             return responses
-        except zmq.Again:
-            print(f"[TIMEOUT] No response received within {timeout_ms}ms")
-            return None
         except Exception as e:
             print(f"[ERROR] Failed to receive response: {e}")
             return None
@@ -81,6 +69,7 @@ def parse_user_input(line: str):
 
 
 def main():
+    # ----------- 解析命令行参数 -----------
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--port", type=int, default=5555, help="ZMQ 端口号")
     args = parser.parse_args()
@@ -88,6 +77,7 @@ def main():
     address = f"tcp://7.150.12.133:{args.port}"
     print(f"[INFO] 使用 ZMQ 地址: {address}")
 
+    # ----------- 启动客户端 -----------
     client = RouterDealerClient(address)
 
     print("\n=== ZMQ Interactive Request Sender ===")
@@ -106,36 +96,11 @@ def main():
         if req is None:
             continue
 
-        if client.send_request(req):
-            print("[WAIT] 等待 ox 返回结果...")
-            
-            # 持续接收响应，直到收到完成信号
-            layers_received = set()
-            while True:
-                resp = client.receive_response(timeout_ms=5000)
-                if resp is None:
-                    print("[TIMEOUT] 等待响应超时")
-                    break
-                
-                for response in resp:
-                    if isinstance(response, dict):
-                        request_id = response.get('request_id', '')
-                        layer_id = response.get('layer_id', -1)
-                        success = response.get('success', False)
-                        
-                        if layer_id == -1:
-                            print(f"[COMPLETE] 请求 {request_id} 全部完成!")
-                            break
-                        elif layer_id >= 0:
-                            if layer_id not in layers_received:
-                                layers_received.add(layer_id)
-                                print(f"[LAYER] 请求 {request_id} 层 {layer_id} 接收成功: {success}")
-                        else:
-                            print(f"[RESPONSE] {response}")
-                    
-                # 检查是否应该退出接收循环
-                if any(isinstance(r, dict) and r.get('layer_id') == -1 for r in resp if isinstance(r, dict)):
-                    break
+        client.send_request(req)
+
+        print("[WAIT] 等待 ox 返回结果...")
+        resp = client.receive_response()
+        print("[RECV]", resp)
 
     client.close()
 
