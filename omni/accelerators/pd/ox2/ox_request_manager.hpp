@@ -11,143 +11,200 @@
 
 using boost::asio::ip::tcp;
 
+class Session;
+
+enum class LayerPhase : uint8_t {
+    Init = 0, // Initialization: No data, no request.
+    Need,     // D-side has requested data, but ZMQ transmission has not yet arrived.
+    Ready,    // ZMQ transmission has arrived, but the D-side has not yet requested it.
+    Pending,  // ZMQ transmission has arrived, and the D-side has issued an application, allowing it to join the queue.
+    Enqueued, // The data has been sent to send_queue_, awaiting processing by the sending coroutine.
+    Sending,  // async_writing
+    Done,     // Sent successfully
+    Failed    // Sent failed, waiting for retransmission
+};
+
 // Request: For each request, the src_id_list and dst_id_list calculate a specific UID.
 class Request {
 public:
     struct LayerState {
-        bool ready = false;
-        bool sent = false;
-        bool need = false;
-        bool sending = false;
-        std::string last_ready_modifier = "默认值";
-        std::string last_sent_modifier = "默认值";
-        std::string last_need_modifier = "默认值";
-        std::string last_sending_modifier = "默认值";
+        LayerPhase phase = LayerPhase::Init;
+        std::string last_phase_modifier = "Init 默认";
         std::vector<boost::asio::mutable_buffer> buffers;
 
-        LayerState() : ready(false), sent(false) {
-            last_ready_modifier = "无参构造函数";
+        LayerState() = default;
+
+        bool is_done() const noexcept {
+            return phase == LayerPhase::Done;
+        }
+
+        bool can_enqueue() const noexcept {
+            return phase == LayerPhase::Pending;
+        }
+
+        const char* phase_str() const noexcept {
+            switch(phase) {
+            case LayerPhase::Init: return "Init";
+            case LayerPhase::Need: return "Need";
+            case LayerPhase::Ready: return "Ready";
+            case LayerPhase::Pending: return "Pending";
+            case LayerPhase::Enqueued: return "Enqueued";
+            case LayerPhase::Sending: return "Sending";
+            case LayerPhase::Done: return "Done";
+            case LayerPhase::Failed: return "Failed";
+            }
+            return "Unknown";
+        }
+
+        void log_phase(const char* tag, int layer_id) const {
+            std::cerr << "[P][LAYER][" << tag << "] layer = " << layer_id
+                      << " phase = " << phase_str()
+                      << " note = " << last_phase_modifier
+                      << " buffers size = " << buffers.size()
+                      << std::endl;
+        }
+
+        void after_receiving_zmq(int layer_id, const std::string& reason) {
+            switch(phase) {
+            case LayerPhase::Init:
+                phase = LayerPhase::Ready;
+                last_phase_modifier = std::string("ZMQ arrived: ") + reason;
+                break;
+            case LayerPhase::Need:
+            case LayerPhase::Failed:
+                phase = LayerPhase::Pending;
+                last_phase_modifier = std::string("ZMQ arrived(requested or failed)") + reason;
+                break;
+            case LayerPhase::Ready:
+            case LayerPhase::Pending:
+            case LayerPhase::Enqueued:
+            case LayerPhase::Sending:
+            case LayerPhase::Done:
+                last_phase_modifier = std::string("ZMQ repeated notification") + reason;
+                break;
+            }
+            log_phase("DATA READY", layer_id);
+        }
+
+        void after_receiving_tcp(int layer_id, const std::string& reason) {
+            switch(phase) {
+            case LayerPhase::Init:
+                phase = LayerPhase::Need;
+                last_phase_modifier = std::string("TCP uid arrived: ") + reason;
+                break;
+            case LayerPhase::Ready:
+            case LayerPhase::Failed:
+                phase = LayerPhase::Pending;
+                last_phase_modifier = std::string("TCP arrived(data ready or failed)") + reason;
+                break;
+            case LayerPhase::Need:
+            case LayerPhase::Pending:
+            case LayerPhase::Enqueued:
+            case LayerPhase::Sending:
+            case LayerPhase::Done:
+                last_phase_modifier = std::string("TCP repeated notification") + reason;
+                break;
+            }
+            log_phase("DATA REQUESTED", layer_id);
+        }
+
+        void mark_enqueued(int layer_id, const std::string& reason) {
+            phase = LayerPhase::Enqueued;
+            last_phase_modifier = std::string("sent to send_queue: ") + reason;
+            log_phase("MARK ENQUEUED", layer_id);
+        }
+
+        void mark_sending(int layer_id, const std::string& reason) {
+            phase = LayerPhase::Sending;
+            last_phase_modifier = std::string("ready for sending: ") + reason;
+            log_phase("MARK SENDING", layer_id);
+        }
+
+        void mark_done(int layer_id, const std::string& reason) {
+            phase = LayerPhase::Done;
+            last_phase_modifier = std::string("sent successfully: ") + reason;
+            log_phase("mark_done", layer_id);
+        }
+
+        void mark_failed(int layer_id, const std::string& reason) {
+            phase = LayerPhase::Failed;
+            last_phase_modifier = std::string("sent failed: ") + reason;
+            log_phase("MARK FAILED", layer_id);
         }
 
         asio::awaitable<void> send(tcp::socket& socket, int layer_id)
         {
+            log_phase("SEND ENTER", layer_id);
+
             if (!socket.is_open()) {
-                std::cerr << "[P] Socket is not open, cannot send." << std::endl;
-                sending = false;
-                last_sending_modifier = "第" + std::to_string(layer_id) + "层发送时socket没开后更新";
+                mark_failed(layer_id, "socket is not open");
                 co_return;
             }
 
             if (buffers.empty()) {
-                std::cerr << "[P] layer " << layer_id
-                          << " buffers empty, skip send" << std::endl;
-                sending = false;
-                last_sending_modifier = "第" + std::to_string(layer_id) + "层发送时buffers为空更新";
+                mark_failed(layer_id, "empty buffers");
                 co_return;
             }
 
             std::cerr << "[P][LayerState] Sending layer with " << buffers.size()
-                    << " chunks, first 8 bytes = " << *(int64_t *)buffers[0].data() << std::endl;
+                      << " chunks, first 8 bytes = " << *(int64_t *)buffers[0].data() << std::endl;
 
             try {
-                std::size_t n = co_await asio::async_write(socket, buffers, asio::use_awaitable);
-                std::cerr << "[P] layer "<< layer_id <<" async_write SUCCESS, bytes sent = " << n << std::endl;
+                /*
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(500));
 
-                // 发送成功：标记已发送完成，并清除 sending 标志
-                sent = true;
-                last_sent_modifier = "第" + std::to_string(layer_id) + "层发送成功后更新";
-                sending = false;
-                last_sending_modifier = "第" + std::to_string(layer_id) + "层发送成功后更新";
-                need = false;
-                last_need_modifier = "第" + std::to_string(layer_id) + "层发送成功后更新";
-                std::cerr << "已发送的层 " << layer_id << "的状态已变为: " << std::endl
-                                          << "ready = " << ready
-                                          << ", sent = " << sent
-                                          << ", need = " << need
-                                          << ", sending = " << sending << std::endl
-                                          << "last_ready_modifier = " << last_ready_modifier << std::endl
-                                          << "last_sent_modifier = " << last_sent_modifier << std::endl
-                                          << "last_need_modifier = " << last_need_modifier << std::endl
-                                          << "last_sending_modifier = " << last_sending_modifier << std::endl;
-                                          
-            } catch (const boost::system::system_error &e) {
-                sending = false;  // 失败也要清掉，否则外层永远以为“正在发送中”
-                last_sending_modifier = "第" + std::to_string(layer_id) + "层发送失败抛出boost::system::system_error后更新";
-                auto error_code = e.code();
-                std::cerr << "[P] layer "<< layer_id <<" async_write FAILED with system_error: "
-                          << error_code.message() << " 其状态现在为: " << std::endl
-                          << "ready = " << ready
-                          << ", sent = " << sent
-                          << ", need = " << need
-                          << ", sending = " << sending << std::endl
-                          << "last_ready_modifier = " << last_ready_modifier << std::endl
-                          << "last_sent_modifier = " << last_sent_modifier << std::endl
-                          << "last_need_modifier = " << last_need_modifier << std::endl
-                          << "last_sending_modifier = " << last_sending_modifier << std::endl;
-                          
-                if (error_code == asio::error::eof) {
-                    std::cerr << "Connection closed by peer. 其状态现在为: " << std::endl
-                              << "ready = " << ready
-                              << ", sent = " << sent
-                              << ", need = " << need
-                              << ", sending = " << sending << std::endl
-                              << "last_ready_modifier = " << last_ready_modifier << std::endl
-                              << "last_sent_modifier = " << last_sent_modifier << std::endl
-                              << "last_need_modifier = " << last_need_modifier << std::endl
-                              << "last_sending_modifier = " << last_sending_modifier << std::endl;
-                              
-                } else if (error_code == asio::error::connection_reset) {
-                    std::cerr << "Connection reset by peer. 其状态现在为: " << std::endl
-                              << "ready = " << ready
-                              << ", sent = " << sent
-                              << ", need = " << need
-                              << ", sending = " << sending << std::endl
-                              << "last_ready_modifier = " << last_ready_modifier << std::endl
-                              << "last_sent_modifier = " << last_sent_modifier << std::endl
-                              << "last_need_modifier = " << last_need_modifier << std::endl
-                              << "last_sending_modifier = " << last_sending_modifier << std::endl;
-                              
+                auto write_op   = asio::async_write(socket, buffers, asio::use_awaitable);
+                auto timeout_op = timer.async_wait(asio::use_awaitable);
+
+                auto result = co_await (std::move(write_op) || std::move(timeout_op));
+
+                if (result.index() == 1) {   // 超时
+                    // socket.cancel();
+                    boost::system::error_code ec;
+                    socket.cancel(ec);
+                    if(ec) {
+                        std::cerr << "[P][TIMEOUT] cancel error: " << ec.message() << std::endl;
+                    }
+
+                    throw std::runtime_error("async_write timeout");
                 }
+
+                // 从 result 中取回 n
+                std::size_t n = std::get<0>(result);
+                */
+
+                std::size_t n = co_await asio::async_write(socket, buffers, asio::use_awaitable);
+
+                std::size_t p_send_total = 0;
+                for (auto& b : buffers)
+                    p_send_total += boost::asio::buffer_size(b);
+
+                std::cerr << "[P][SEND_CHECK] uid=? layer=" << layer_id
+                          << " buffers_total=" << p_send_total
+                          << " bytes_sent = " << n
+                          << std::endl;
+                mark_done(layer_id, "async_write SUCCESS");
+            } catch (const boost::system::system_error &e) {
+                auto error_code = e.code();
+                mark_failed(layer_id, std::string("boost::system::system_error: ") + error_code.message());
             } catch (const std::exception &e) {
-                sending = false;
-                last_sending_modifier = "第" + std::to_string(layer_id) + "层发送失败抛出std::exception后更新";
-                std::cerr << "[P] layer "<< layer_id <<" async_write FAILED with exception: "
-                        << e.what() << " 其状态现在为：" << std::endl
-                        << "ready = " << ready
-                        << ", sent = " << sent
-                        << ", need = " << need
-                        << ", sending = " << sending << std::endl
-                        << "last_ready_modifier = " << last_ready_modifier << std::endl
-                        << "last_sent_modifier = " << last_sent_modifier << std::endl
-                        << "last_need_modifier = " << last_need_modifier << std::endl
-                        << "last_sending_modifier = " << last_sending_modifier << std::endl;
+                mark_failed(layer_id, std::string("std::exception: ") + e.what());
 
             } catch (...) {
-                sending = false;
-                last_sending_modifier = "第" + std::to_string(layer_id) + "层发送失败抛出其他异常后更新";
-                std::cerr << "[P] layer " << layer_id
-                          << " async_write FAILED (unknown). 其状态现在为：" << std::endl
-                          << "ready = " << ready
-                          << ", sent = " << sent
-                          << ", need = " << need
-                          << ", sending = " << sending << std::endl
-                          << "last_ready_modifier = " << last_ready_modifier << std::endl
-                          << "last_sent_modifier = " << last_sent_modifier << std::endl
-                          << "last_need_modifier = " << last_need_modifier << std::endl
-                          << "last_sending_modifier = " << last_sending_modifier << std::endl;
-                          
+                mark_failed(layer_id, "unknown exception");
             }
-            co_return; 
+
+            log_phase("SEND EXIT", layer_id);
+            co_return;
         }
+
     };
 
     int64_t uid;
-
-    // key = layer_id -> state
     std::map<int, LayerState> layer_states;
-
-    // mutex for one request
     std::mutex req_mutex;
+    std::weak_ptr<Session> owner;
 
     Request(int64_t uid_, int num_layers)
         : uid(uid_)
@@ -162,33 +219,6 @@ public:
 // Global request map
 inline std::unordered_map<int64_t, std::shared_ptr<Request>> global_requests;
 inline std::mutex global_requests_mutex;
-
-inline std::shared_ptr<Request> find_request(int64_t uid) {
-    std::lock_guard<std::mutex> lock(global_requests_mutex);
-
-    auto it = global_requests.find(uid);
-    return (it != global_requests.end()) ? it->second : nullptr;
-}
-
-inline bool is_layer_ready(std::shared_ptr<Request> req, int layer)
-{
-    std::lock_guard<std::mutex> lock(req->req_mutex);
-    return req->layer_states[layer].ready;
-}
-
-inline std::shared_ptr<Request> ensure_request(int64_t uid, int num_layers)
-{
-    std::lock_guard<std::mutex> lock(global_requests_mutex);
-
-    auto it = global_requests.find(uid);
-    if (it != global_requests.end()) {
-        return it->second;
-    }
-
-    auto req = std::make_shared<Request>(uid, num_layers);
-    global_requests[uid] = req;
-    return req;
-}
 
 inline void add_request(std::shared_ptr<Request> req) {
     if (!req) return;

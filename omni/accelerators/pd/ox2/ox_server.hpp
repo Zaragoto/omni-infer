@@ -12,7 +12,6 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 
 #include <iostream>
 #include <vector>
@@ -27,7 +26,6 @@ using asio::detached;
 using asio::use_awaitable;
 using asio::experimental::concurrent_channel;
 using asio::ip::tcp;
-using namespace boost::asio::experimental::awaitable_operators;
 
 struct ZmqCmd {
     table_id_t table_id = 0;
@@ -55,31 +53,102 @@ inline void optimize_tcp_socket(tcp::socket &socket)
 }
 
 class Session : public std::enable_shared_from_this<Session> {
+private:
+    tcp::socket socket_;
+    BlockTable &bt_;
+    int num_layers_;
+    std::shared_ptr<ZmqCoroutineSocket> zmq_socket_;
+    asio::io_context& io_ctx_;
+    concurrent_channel<void(boost::system::error_code, std::pair<std::shared_ptr<Request>, int>)> send_queue_;
 public:
     Session(tcp::socket socket, BlockTable &bt, int num_layers, std::shared_ptr<ZmqCoroutineSocket> shared_zmq)
-        :  socket_(std::move(socket)), bt_(bt), num_layers_(num_layers), zmq_socket_(shared_zmq), io_ctx_(static_cast<asio::io_context&>(socket_.get_executor().context()))
+        :  socket_(std::move(socket)), bt_(bt), num_layers_(num_layers),
+           zmq_socket_(shared_zmq), io_ctx_(static_cast<asio::io_context&>(socket_.get_executor().context())),
+           send_queue_(io_ctx_, 1000)
     {}
 
     void start()
     {
         co_spawn(
             socket_.get_executor(),
-            [self = shared_from_this(), this]() -> asio::awaitable<void> { co_await self->process_connection(num_layers_); },
-            asio::detached);
-
-        /*
-        if (zmq_socket_) {
-                    co_spawn(
-                        socket_.get_executor(),
-                        [self = shared_from_this(), this]() -> asio::awaitable<void> { co_await self->listen_zmq(num_layers_,
-                        bt_); }, asio::detached);
-                }
-        */
-
+            [self = shared_from_this(), this]() -> asio::awaitable<void> {
+                co_await self->process_connection(num_layers_);
+            },
+            detached);
         co_spawn(
             socket_.get_executor(),
-            [self = shared_from_this(), this]() -> asio::awaitable<void> { co_await self->send_layers(); },
-            asio::detached);
+            [self = shared_from_this(), this]() -> asio::awaitable<void> {
+                co_await self->process_send_queue();
+            },
+            detached);
+    }
+
+    void try_trigger_send(const std::shared_ptr<Request>& req, int layer_id, const char* trigger_source) {
+        std::lock_guard<std::mutex> lock(req->req_mutex);
+        auto it = req->layer_states.find(layer_id);
+        if(it == req->layer_states.end()) {
+            std::cerr << "[TTS][TRY] uid = " << req->uid
+                      << " layer = " << layer_id
+                      << " from = " << trigger_source
+                      << " but no such layer in layer_states"
+                      << std::endl;
+            return;
+        }
+
+        auto &state = it->second;
+
+        std::cerr << "[TTS][TRY] uid = " << req->uid
+                  << " layer = " << layer_id
+                  << " from = " << trigger_source
+                  << " phase = " << state.phase_str()
+                  << " buffers size = " << state.buffers.size()
+                  << std::endl;
+
+        // Only those with a status of Pending can be considered for joining the queue.
+        if(!state.can_enqueue()) {
+            std::cerr << "[TTS][SKIP] uid = " << req->uid
+                      << " layer = " << layer_id
+                      << " from = " << trigger_source
+                      << " not in Pending phase, skip enqueue."
+                      << std::endl;
+            return;
+        }
+
+        if(state.buffers.empty()) {
+            std::cerr << "[TTS][SKIP] uid = " << req->uid
+                      << " layer = " << layer_id
+                      << " from = " << trigger_source
+                      << " Pending but buffers empty, skip."
+                      << std::endl;
+            return;
+        }
+
+        // Transmission is allowed only after the previous layer has been sent.
+        if(layer_id > 0) {
+            auto it_prev = req->layer_states.find(layer_id - 1);
+            if(it_prev == req->layer_states.end() || !it_prev->second.is_done()) {
+                std::cerr << "[TTS][WAIT] uid = " << req->uid
+                          << " layer = " << layer_id
+                          << " from = " << trigger_source
+                          << " prev layer not Done, wait."
+                          << std::endl;
+            return;
+            }
+        }
+
+        // Enqueue
+        state.mark_enqueued(layer_id, std::string("try_trigger_send from ") + trigger_source);
+
+        std::cerr << "[TTS][ENQUEUE] uid = " << req->uid
+                  << " layer = " << layer_id
+                  << " from = " << trigger_source
+                  << " push into send_queue_"
+                  << std::endl;
+
+        send_queue_.try_send(
+            boost::system::error_code{},
+            std::make_pair(req, layer_id)
+        );
     }
 
 private:
@@ -106,24 +175,24 @@ private:
                 // 情况 A：未找到 => 创建新的 Request
                 //-----------------------------------------------------
                 if (!req) {
-                    auto new_req =
-                        std::make_shared<Request>(uid, num_layers);
+                    auto new_req = std::make_shared<Request>(uid, num_layers);
 
                     {
                         std::lock_guard<std::mutex> req_lock(new_req->req_mutex);
 
                         for (auto& [layer_id, layer_state] : new_req->layer_states) {
                             // ready/sent 全部设为 false
-                            layer_state.ready = false;
-                            layer_state.last_ready_modifier = "process_connection里来自TCP通知的uid为" + std::to_string(uid) + "的request创建";
-                            layer_state.sent = false;
-                            layer_state.last_sent_modifier = "process_connection里来自TCP通知的uid为" + std::to_string(uid) + "的request创建";
-                            layer_state.need = true;
-                            layer_state.last_need_modifier = "process_connection里来自TCP通知的uid为" + std::to_string(uid) + "的request创建";
-                            layer_state.sending = false;
-                            layer_state.last_sending_modifier = "process_connection里来自TCP通知的uid为" + std::to_string(uid) + "的request创建";
+                            layer_state.phase = LayerPhase::Init;
+                            layer_state.last_phase_modifier = "new request, Init";
+                            layer_state.log_phase("NEW REQUEST", layer_id);
+
+                            layer_state.after_receiving_tcp(layer_id,
+                                "process_connection TCP uid = " + std::to_string(uid) + " create a new request");
                         }
                     }
+
+                    // Binding a Session
+                    new_req->owner = shared_from_this();
 
                     // 加入全局字典
                     {
@@ -132,18 +201,39 @@ private:
                     }
 
                     req = new_req;
+
+                    // Try to send immediately
+                    for(auto &[layer_id, state] : req->layer_states) {
+                        try_trigger_send(req, layer_id, "tcp_new_req");
+                    }
                 }
                 //-----------------------------------------------------
                 // 情况 B：已存在 => 更新 need
                 //-----------------------------------------------------
                 else {
-                    std::lock_guard<std::mutex> req_lock(req->req_mutex);
+                    {
+                        std::lock_guard<std::mutex> req_lock(req->req_mutex);
 
-                    for (auto &[layer_id, layer_state] : req->layer_states) {
-                        if(!layer_state.sent){
-                            layer_state.need = true;
-                            layer_state.last_need_modifier = "process_connection里第" + std::to_string(layer_id) + "层更新";
+                        // Binding a Session
+                        if(req->owner.expired()) {
+                            req->owner = shared_from_this();
                         }
+
+                        std::cerr << "[TCP][EXIST] uid = " << uid
+                                  << " set Need on all non-Done layers."
+                                  << std::endl;
+
+                        for (auto &[layer_id, layer_state] : req->layer_states) {
+                            if(!layer_state.is_done()) {
+                                layer_state.after_receiving_tcp(layer_id,
+                                "process_connection TCP uid = " + std::to_string(uid) + " exist request");
+                            }
+                        }
+                    }
+
+                    // Try to send immediately
+                    for(auto &[layer_id, _] : req->layer_states) {
+                        try_trigger_send(req, layer_id, "tcp_exist_req");
                     }
                 }
             }
@@ -152,6 +242,7 @@ private:
         }
     }
 
+    /*
     asio::awaitable<void> send_layers() {
         auto executor = co_await boost::asio::this_coro::executor;
 
@@ -171,54 +262,42 @@ private:
 
                     for (auto &[layer_id, state] : req_ptr->layer_states) {
                         // 如果上一层没传，先不传该层
+                        
                         if (layer_id > 0) {
                             auto it_prev = req_ptr->layer_states.find(layer_id - 1);
                             if (it_prev == req_ptr->layer_states.end() || !it_prev->second.sent) {
                                 continue;
                             }
                         }
+                        
 
                         if (!state.sent)
                             all_sent = false;
 
-                        if (state.ready && !state.sent && state.need && !state.buffers.empty()) {
-                            // std::cerr << "检测到需要发送的层" << layer_id << std::endl;
-                            // ======== 立刻发送该层 ========
-                            // 用 co_spawn 启动 LayerState::send() 协程
-                            if (!state.sending){
-                                std::cerr << "检测到需要发送的层" << layer_id << std::endl
-                                          << "目前其状态为: ready = " << state.ready
-                                          << ", sent = " << state.sent
-                                          << ", need = " << state.need
-                                          << ", sending = " << state.sending << std::endl
-                                          << "last_ready_modifier = " << state.last_ready_modifier << std::endl
-                                          << "last_sent_modifier = " << state.last_sent_modifier << std::endl
-                                          << "last_need_modifier = " << state.last_need_modifier << std::endl
-                                          << "last_sending_modifier = " << state.last_sending_modifier << std::endl;
-                                          
-                                state.sending = true;
-                                // co_spawn(
-                                // executor,
-                                // state.send(socket_, layer_id),     // 调用该 layer 的 send()
-                                // asio::detached
-                                // );
-                                co_await state.send(socket_, layer_id);
-                            } else {
-                                std::cerr << "检测到重复需要发送的层" << layer_id << std::endl
-                                          << "目前其状态为: ready = " << state.ready
-                                          << ", sent = " << state.sent
-                                          << ", need = " << state.need
-                                          << ", sending = " << state.sending << std::endl
-                                          << "last_ready_modifier = " << state.last_ready_modifier << std::endl
-                                          << "last_sent_modifier = " << state.last_sent_modifier << std::endl
-                                          << "last_need_modifier = " << state.last_need_modifier << std::endl
-                                          << "last_sending_modifier = " << state.last_sending_modifier << std::endl;
-                                          
-                                continue;
-                            }
+                        if (state.ready && !state.sent && state.need && !state.buffers.empty() && !state.sending) {
+                            state.need = false;
+                            state.last_need_modifier = "第" + std::to_string(layer_id) + "层加入发送队列后清除need";
+                            // ======== 把该层送进队列 ========
+                            std::cerr << "\n检测到需要发送的层" << layer_id << std::endl
+                                      << "目前其状态为: ready = " << state.ready
+                                      << ", sent = " << state.sent
+                                      << ", need = " << state.need
+                                      << ", sending = " << state.sending << std::endl
+                                      << "last_ready_modifier = " << state.last_ready_modifier << std::endl
+                                      << "last_sent_modifier = " << state.last_sent_modifier << std::endl
+                                      << "last_need_modifier = " << state.last_need_modifier << std::endl
+                                      << "last_sending_modifier = " << state.last_sending_modifier << std::endl;
+                            // co_spawn(
+                            // executor,
+                            // state.send(socket_, layer_id),     // 调用该 layer 的 send()
+                            // detached
+                            // );
                             // co_await state.send(socket_, layer_id);
-
-                            // state.sent = true;
+                            co_await send_queue_.async_send(
+                                boost::system::error_code{},
+                                std::make_pair(req_ptr, layer_id),
+                                use_awaitable
+                            );
                         }
                     }
 
@@ -235,16 +314,98 @@ private:
             }
 
             // 防止忙等
-            co_await boost::asio::steady_timer(executor, std::chrono::milliseconds(1))
-                .async_wait(asio::use_awaitable);
+            co_await boost::asio::steady_timer(executor, std::chrono::milliseconds(10))
+                .async_wait(use_awaitable);
         }
     }
+    */
 
-    tcp::socket socket_;
-    BlockTable &bt_;
-    int num_layers_;
-    std::shared_ptr<ZmqCoroutineSocket> zmq_socket_;
-    asio::io_context& io_ctx_;
+    asio::awaitable<void> process_send_queue() {
+        for (;;) {
+            auto [req, layer_id] = co_await send_queue_.async_receive(use_awaitable);
+
+            {
+                std::lock_guard<std::mutex> lock(req->req_mutex);
+                auto &state = req->layer_states[layer_id];
+
+                std::cerr << "[SEND][BEGIN] uid = " << req->uid
+                          << " layer = " << layer_id
+                          << " phase = " << state.phase_str()
+                          << std::endl;
+
+                state.mark_sending(layer_id, "process_send_queue begin");
+            }
+            
+            auto &state = req->layer_states[layer_id];
+            co_await state.send(socket_, layer_id);
+
+            bool need_trigger_next = false;
+            int next_layer = -1;
+            bool all_done = false;
+            bool need_retry = false;
+
+
+            {
+                std::lock_guard<std::mutex> lock(req->req_mutex);
+
+                if(state.phase == LayerPhase::Done) {
+                    std::cerr << "[SEND][OK] uid = " << req->uid
+                              << " layer = " << layer_id
+                              << " done, try trigger next"
+                              << std::endl;
+
+                    // if trigger next layer
+                    next_layer = layer_id + 1;
+                    if(next_layer < num_layers_) {
+                        need_trigger_next = true;
+                        // try_trigger_send(req, next_layer, "prev done");
+                    }
+
+                    // check if all layers are sent
+                    all_done = true;
+                    for(auto &[lid, st] : req->layer_states) {
+                        if(!st.is_done()) {
+                            all_done = false;
+                            break;
+                        }
+                    }
+                    if(all_done) {
+                        std::cerr << "[REQ][GC] uid = " << req->uid
+                                  << " all layers done, remove request"
+                                  << std::endl;
+                        remove_request(req->uid);
+                    }
+                } else if(state.phase == LayerPhase::Failed) {
+                    std::cerr << "[SEND][FAILED] uid = " << req->uid
+                              << " layer = " << layer_id
+                              << " mark need & retry later"
+                              << std::endl;
+
+                    need_retry = true;
+                    // state.after_receiving_tcp(layer_id, "send failed, retry need");
+                    // try_trigger_send(req, layer_id, "retry_after_fail");
+                } else {
+                    std::cerr << "[SEND][UNEXPECTED] uid = " << req->uid
+                              << " layer = " << layer_id
+                              << " phase = " << state.phase_str()
+                              << " after send. No action."
+                              << std::endl;
+                }
+            }
+
+            if(need_trigger_next) {
+                try_trigger_send(req, next_layer, "prev done");
+            }
+
+            if(need_retry) {
+                {
+                    std::lock_guard<std::mutex> lock(req->req_mutex);
+                    state.after_receiving_tcp(layer_id, "send failed, retry need");
+                }
+                try_trigger_send(req, layer_id, "retry_after_fail");
+            }
+        }
+    }
 };
 
 class Server {
@@ -276,18 +437,18 @@ public:
             co_spawn(
                 acceptor_.get_executor(),
                 [this]() -> asio::awaitable<void> { co_await listen_zmq_global(); },
-                asio::detached);
+                detached);
 
             // 运行异步任务处理器
             co_spawn(
                 acceptor_.get_executor(),
                 [this]() -> asio::awaitable<void> { co_await process_zmq_tasks(); },
-                asio::detached);
+                detached);
         }
 
         while (true) {
             try {
-                tcp::socket socket = co_await acceptor_.async_accept(asio::use_awaitable);
+                tcp::socket socket = co_await acceptor_.async_accept(use_awaitable);
                 optimize_tcp_socket(socket);
 
                 std::cout << "[Server] New TCP from: " << socket.remote_endpoint().address().to_string() << ":"
@@ -332,15 +493,15 @@ public:
                     ZmqCmd cmd;
                     oh.get().convert(cmd);
                 
-                    std::cerr << "[Session ZMQ] table=" << cmd.table_id << " layer=" << cmd.layer_id
-                              << " blocks=" << cmd.block_ids.size() << " rank=" << cmd.rank << std::endl;
+                    std::cerr << "[Session ZMQ] table = " << cmd.table_id << " layer = " << cmd.layer_id
+                              << " blocks = " << cmd.block_ids.size() << " rank = " << cmd.rank << std::endl;
                 
                     int64_t uid = generate_uid_from_block_list(cmd.block_ids);
                     std::cerr << "[Session]: get uid from zmq: " << uid << std::endl;
 
                     // 快速创建任务并放入队列，立即返回继续接收下一条消息
                     ZmqTask task{std::move(cmd), uid};
-                    co_await zmq_task_channel_.async_send(boost::system::error_code{}, task, asio::use_awaitable);
+                    co_await zmq_task_channel_.async_send(boost::system::error_code{}, task, use_awaitable);
                 
                 } catch (const std::exception& e) {
                     std::cerr << "[Session ZMQ] parse error: " << e.what() << std::endl;
@@ -348,7 +509,7 @@ public:
             } catch (const std::exception& e) {
                 std::cerr << "[Session ZMQ] listener exception: " << e.what() << std::endl;
                 asio::steady_timer timer(co_await asio::this_coro::executor, std::chrono::milliseconds(1));
-                co_await timer.async_wait(asio::use_awaitable);
+                co_await timer.async_wait(use_awaitable);
             }
         }
     }
@@ -358,7 +519,7 @@ private:
     {
         for (;;) {
             try {
-                auto task = co_await zmq_task_channel_.async_receive(asio::use_awaitable);
+                auto task = co_await zmq_task_channel_.async_receive(use_awaitable);
                 // 处理任务
                 handle_zmq_task(task);
             } catch (const boost::system::system_error &e) {
@@ -387,39 +548,71 @@ private:
             {
                 std::lock_guard<std::mutex> lock(new_req->req_mutex);
                 auto& target_layer = new_req->layer_states[task.cmd.layer_id];
-                target_layer.ready = true;
-                target_layer.last_ready_modifier = "来自zmq通知的uid为" + std::to_string(task.uid) + "的第" + std::to_string(task.cmd.layer_id) + "层request创建";
+                
                 target_layer.buffers = bt_.get_buffers_one_layer(
                     /*table_id*/ 0,
                     /*block_list*/ task.cmd.block_ids,
                     /*rank*/ 0,
                     /*layer_id*/ task.cmd.layer_id);
-                    
-                if (!target_layer.buffers.empty()) {
-                    std::cerr << "[Server]: get buffers of layer " << task.cmd.layer_id << std::endl;
-                } else {
-                    std::cerr << "[Server]: empty buffers of layer " << task.cmd.layer_id << std::endl;
+
+                // ===== [P] 打印该 layer 的 buffers 大小 =====
+                std::size_t p_total_bytes = 0;
+                std::cerr << "[P][BUF] uid = " << task.uid
+                          << " layer = " << task.cmd.layer_id
+                          << " buffers.size = " << target_layer.buffers.size();
+
+                for (std::size_t i = 0; i < target_layer.buffers.size(); ++i) {
+                    auto sz = boost::asio::buffer_size(target_layer.buffers[i]);
+                    p_total_bytes += sz;
+                    std::cerr << " buf[" << i << "]=" << sz;
                 }
+                std::cerr << " total=" << p_total_bytes << std::endl;
+
+                target_layer.after_receiving_zmq(
+                    static_cast<int>(task.cmd.layer_id),
+                    "ZMQ new data uid = " + std::to_string(task.uid));
             }
             
             add_request(new_req);
+            // try_trigger_send(new_req, static_cast<int>(task.cmd.layer_id), "zmq_new");
         } else {
-            std::lock_guard<std::mutex> lock(req->req_mutex);
-            auto& target_layer = req->layer_states[task.cmd.layer_id];
-            if (!target_layer.ready) {
+            int layer_id = static_cast<int>(task.cmd.layer_id);
+
+            {
+                std::lock_guard<std::mutex> lock(req->req_mutex);
+                auto& target_layer = req->layer_states[layer_id];
+
                 target_layer.buffers = bt_.get_buffers_one_layer(
                     /*table_id*/ 0,
                     /*block_list*/ task.cmd.block_ids,
                     /*rank*/ 0,
                     /*layer_id*/ task.cmd.layer_id);
-                    
-                if (!target_layer.buffers.empty()) {
-                    std::cerr << "[Server]: get buffers of layer " << task.cmd.layer_id << std::endl;
-                } else {
-                    std::cerr << "[Server]: empty buffers of layer " << task.cmd.layer_id << std::endl;
+                // ===== [P] 打印该 layer 的 buffers 大小 =====
+                std::size_t p_total_bytes = 0;
+                std::cerr << "[P][BUF] uid = " << task.uid
+                          << " layer = " << task.cmd.layer_id
+                          << " buffers.size = " << target_layer.buffers.size();
+
+                for (std::size_t i = 0; i < target_layer.buffers.size(); ++i) {
+                    auto sz = boost::asio::buffer_size(target_layer.buffers[i]);
+                    p_total_bytes += sz;
+                    std::cerr << " buf[" << i << "]=" << sz;
                 }
-                target_layer.ready = true;
-                target_layer.last_ready_modifier = "来自zmq通知的第" + std::to_string(task.cmd.layer_id) + "层ready更新";
+                std::cerr << " total=" << p_total_bytes << std::endl;
+
+                target_layer.after_receiving_zmq(
+                    layer_id,
+                    "ZMQ exist data uid = " + std::to_string(task.uid));
+            }
+            
+            // try_trigger_send(req, layer_id, "zmq_exist");
+            if(auto session = req->owner.lock()) {
+                session->try_trigger_send(req, layer_id, "zmq_exist");
+            } else {
+                std::cerr << "[ZMQ][WARN] uid = " << task.uid
+                          << " layer = " << layer_id
+                          << " has no owning Session, skip triggrt."
+                          << std::endl; 
             }
         }
     }
@@ -432,5 +625,5 @@ private:
     std::shared_ptr<ZmqCoroutineSocket> shared_zmq_;
     asio::io_context &io_context_;
     // 用来异步处理任务的通道
-    asio::experimental::concurrent_channel<void(boost::system::error_code, ZmqTask)> zmq_task_channel_;
+    concurrent_channel<void(boost::system::error_code, ZmqTask)> zmq_task_channel_;
 };

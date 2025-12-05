@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 
 # seconds, used to free blocks after a delay once the request is finished
 BLOCK_RELEASE_DELAY = 3000
-PER_REQUEST_CONNECTION = 8
+PER_REQUEST_CONNECTION = 1
 
 BASE_DIR = os.path.dirname(__file__)
 OX_PATH = os.environ.get("OX_PATH", os.path.join(BASE_DIR, "ox2/ox")) # call the ox for layerwise kv transfer

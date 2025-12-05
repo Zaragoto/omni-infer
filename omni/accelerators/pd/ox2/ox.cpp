@@ -97,6 +97,18 @@ public:
 
                 // auto bufs = bt.get_buffers_interleaved(table_id, dst_ids, rank);
                 auto bufs = bt.get_buffers_layerwise(table_id, dst_ids, rank);
+                // ===== [D] 打印期望接收的 buffers 大小 =====
+                std::size_t d_total_bytes = 0;
+                std::cerr << "[D][BUF]"
+                          << " dst_ids.size=" << dst_ids.size()
+                          << " buffers.size=" << bufs.size();
+
+                for (std::size_t i = 0; i < bufs.size(); ++i) {
+                    auto sz = boost::asio::buffer_size(bufs[i]);
+                    d_total_bytes += sz;
+                    std::cerr << " buf[" << i << "]=" << sz;
+                }
+                std::cerr << " total=" << d_total_bytes << std::endl;
                 
                 // for (auto id : src_ids) {
                 //     std::cout << "Request for ID:" << id << std::endl;
@@ -122,7 +134,7 @@ public:
                               asio::buffer(&uid, sizeof(uid)),
                               asio::use_awaitable) &&
                           asio::async_read(socket, bufs, asio::use_awaitable));
-                }catch (const std::exception &e) {
+                } catch (const std::exception &e) {
                 std::cerr << "[D] async_read FAILED:" << e.what() << std::endl;
             }
                 
