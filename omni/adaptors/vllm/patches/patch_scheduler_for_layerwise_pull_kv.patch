@@ -1,13 +1,18 @@
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 1f01c1e0a..dac921cc4 100644
+index 1f01c1e0a..bbf2df249 100755
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -556,7 +556,7 @@ class Scheduler(SchedulerInterface):
-                 # KVConnector: update internal state after allocation.
-                 # This information is used to determine if a load is
-                 # needed for this request.
--                if num_external_computed_tokens:
-+                if num_external_computed_tokens or os.getenv("ROLE", None) == "prefill":
-                     assert self.connector is not None
-                     self.connector.update_state_after_alloc(
-                         request,
+@@ -563,6 +563,13 @@ class Scheduler(SchedulerInterface):
+                         new_computed_blocks + new_blocks,
+                         num_external_computed_tokens,
+                     )
++                elif os.getenv("ROLE", None) == "prefill":
++                    assert self.connector is not None
++                    self.connector.update_state_after_alloc(
++                        request,
++                        new_blocks,
++                        num_external_computed_tokens,
++                    )
+ 
+                 self.waiting.pop_request()
+                 if load_kv_async:

@@ -700,7 +700,7 @@ class PrefillConnectorWorker:
                     packed = msgpack.packb(cmd)
                     try:
                         self.sock_layer.send(packed, zmq.NOBLOCK)
-                        logger.warning(f"[ZMQ controller] sent layer {layer_idx} to ox server")
+                        logger.warning(f"[ZMQ controller] sent layer {layer_idx} to ox server for blocks: {block_table}")
                     except Exception as e:
                         logger.warning("[ZMQ controller] failed to send:", e)
                         break
@@ -1214,6 +1214,7 @@ class DecodeConnectorWorker:
         client = RouterDealerClient(self._endpoint)
         try:
             while not self._resp_stop.is_set():
+                # send queued requests
                 while True:
                     try:
                         item: _SendItem = self._send_q.get_nowait()
@@ -1227,28 +1228,10 @@ class DecodeConnectorWorker:
                         dst_id_list=item.dst_ids,
                         rank_id=item.rank_id,
                     )
-                    with self._pending_lock:
-                        if item.request_id in self._pending:
-                            ctx = self._pending[item.request_id]
-                            ctx.t_sent = time.time()
-                            try:
-                                if ok:
-                                    ids0 = ctx.local_block_ids[0] if ctx.local_block_ids else []
-                                    if ids0:
-                                        if not hasattr(self, "_prebuilt_block_tables"):
-                                            self._prebuilt_block_tables = {}
-                                        if item.request_id not in self._prebuilt_block_tables:
-                                            self._prebuilt_block_tables[item.request_id] = torch.tensor(
-                                                ids0, dtype=torch.long, device=self.omni_cache.device
-                                            )
-                            except Exception as e:
-                                logger.debug("Prebuild block_table_ts failed for req_id=%s: %s", item.request_id, e)
                     if not ok:
                         logger.error("Send failed for req_id=%s", item.request_id)
                         with self._pending_lock:
                             self._pending.pop(item.request_id, None)
-                        if hasattr(self, "_prebuilt_block_tables"):
-                            self._prebuilt_block_tables.pop(item.request_id, None)
                     else:
                         logger.debug("Sent req_id=%s in %.6f s", item.request_id, time.time() - t0)
                     self._send_q.task_done()
@@ -1256,9 +1239,24 @@ class DecodeConnectorWorker:
                 resp = client.receive_response(timeout=50)
                 if resp is None:
                     continue
+                if not isinstance(resp, dict):
+                    raise RuntimeError(f"Invalied responds format!")
 
                 req_id = resp.get("request_id")
+                if not isinstance(req_id, str):
+                    raise RuntimeError(f"Invalied responds format!")
+
+                # parse layer tag if provided in request id (format you used elsewhere)
+                layer_id = None
+                if "#L" in req_id:
+                    req_id, layer_part = req_id.split("#L", 1)
+                    try:
+                        layer_id = int(layer_part)
+                    except Exception:
+                        layer_id = None
+
                 success = bool(resp.get("success"))
+
                 if not req_id:
                     logger.error("Received response without request_id: %s", resp)
                     continue
@@ -1274,6 +1272,7 @@ class DecodeConnectorWorker:
                         self._prebuilt_block_tables.pop(req_id, None)
                     continue
 
+                # keep original timing log
                 self._log_network_timing(ctx)
 
                 if not success:
@@ -1283,16 +1282,151 @@ class DecodeConnectorWorker:
                     if hasattr(self, "_prebuilt_block_tables"):
                         self._prebuilt_block_tables.pop(req_id, None)
                     continue
+                else:
+                    if layer_id:
+                        logger.warning(f"======= done ox pull kv for layer {layer_id} ======")
 
+                # - If this response contains a layer tag (#L<layer>), do per-layer H2D and track progress.
+                # - If there's no layer tag, IGNORE it (per your request).
                 try:
-                    self._h2d_q.put(ctx, timeout=1.0)
-                except queue.Full:
-                    logger.warning("H2D queue full, running _post_success inline (may block IO)")
-                    self._post_success(ctx)
-                    with self._pending_lock:
-                        self._pending.pop(req_id, None)
+                    if layer_id is not None and layer_id >= 0:
+                        # Per-layer response: perform H2D for this layer and try finalize.
+                        try:
+                            self._post_success_layer(ctx, layer_id)
+                        except Exception as e:
+                            logger.exception("Per-layer H2D failed for req_id=%s layer=%s: %s", req_id, layer_id, e)
+                        # we handled a per-layer response; continue loop
+                        continue
+                    else:
+                        # No layer tag -> per user request we ignore final responses entirely.
+                        logger.debug("Ignoring final/no-layer ZMQ response for req_id=%s (per configuration)", req_id)
+                        continue
+                except Exception as e:
+                    logger.exception("Error handling ZMQ response for req_id=%s layer=%s: %s", req_id, layer_id, e)
+                    # don't crash the recv loop
         finally:
             client.close()
+
+    def _post_success_layer(self, ctx: 'PendingReq', layer_id: int):
+        """
+        Perform H2D copy for a single layer of ctx.
+        After success, mark layer done and try finalize if all layers finished.
+        This function does the synchronous synchronize_h2d for the single layer.
+        """
+        # Wait for any global H2D precondition as in full _post_success
+        DecodeConnectorWorker._h2d_wait.wait()
+        t_h2d_start = time.time()
+
+        # Extract per-layer block ids from ctx.local_block_ids
+        try:
+            if not hasattr(ctx, "local_block_ids") or ctx.local_block_ids is None:
+                raise RuntimeError("ctx.local_block_ids missing")
+        except Exception as e:
+            logger.exception("Cannot determine layer block ids for req_id=%s layer=%s: %s",
+                             getattr(ctx, "request_id", "<unknown>"), layer_id, e)
+            return
+
+        # Attempt synchronize for that layer
+        try:
+            self.omni_cache.synchronize_h2d_layerwise(ctx.local_block_ids, layer_id)
+            t_h2d_end = time.time()
+            logger.warning(" ***** Time cost of per-layer synchronize_h2d is %.3f ms (req_id:%s layer:%d)",
+                           (t_h2d_end - t_h2d_start) * 1000.0,
+                           getattr(ctx, "request_id", "<unknown>"),
+                           layer_id)
+        except Exception as e:
+            logger.exception("synchronize_h2d failed for req_id=%s layer=%s: %s",
+                             getattr(ctx, "request_id", "<unknown>"), layer_id, e)
+            return
+
+        # mark layer copied on ctx (thread-safe with pending_lock)
+        try:
+            with self._pending_lock:
+                if not hasattr(ctx, "_layers_done") or ctx._layers_done is None:
+                    ctx._layers_done = set()
+                ctx._layers_done.add(layer_id)
+                logger.warning(f"======= done h2d copy for layer {layer_id} ======")
+
+                # lazily record total layers if available
+                if not hasattr(ctx, "_layers_total") or ctx._layers_total is None:
+                    ctx._layers_total = self.omni_cache.num_layers
+
+                # try to finalize if all layers done
+                self._maybe_finalize(ctx)
+        except Exception:
+            logger.exception("Failed to record per-layer completion for req_id=%s layer=%s",
+                             getattr(ctx, "request_id", "<unknown>"), layer_id)
+
+    def _maybe_finalize(self, ctx: 'PendingReq'):
+        """
+        If all expected layers have been copied, perform finalization actions:
+        - send pulled kv req list (if remote_request_id present)
+        - append ctx.request_id to _recving_transfers under _transfer_lock
+        - remove ctx from pending and prebuilt tables
+        This function is idempotent and thread-safe (holds _pending_lock when modifying shared state).
+        """
+        req_id = getattr(ctx, "request_id", None)
+        if req_id is None:
+            return False
+
+        # We require a known total or derive it from ctx._layers_total; if unknown, we cannot finalize.
+        total_layers = getattr(ctx, "_layers_total", None)
+        layers_done = getattr(ctx, "_layers_done", set())
+
+        if total_layers is None:
+            # cannot decide yet; do nothing
+            return False
+
+        if not isinstance(layers_done, (set, list)):
+            return False
+
+        if len(layers_done) < total_layers:
+            # not all layers done yet
+            return False
+
+        # At this point, all layers are done -> perform final actions once.
+        # Use a flag to make this idempotent.
+        if getattr(ctx, "_finalized", False):
+            return True
+
+        try:
+            # mark finalized early to avoid races
+            ctx._finalized = True
+
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            if tp_size == 1:
+                if ctx.remote_request_id is not None:
+                    try:
+                        self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
+                    except Exception:
+                        logger.exception("Failed _send_pulled_kv_req_list for req_id=%s", req_id)
+                with self._transfer_lock:
+                    self._recving_transfers.append(ctx.request_id)
+            else:
+                # barrier & sending as original
+                torch.distributed.barrier(group=get_tp_group().cpu_group)
+                if get_tensor_model_parallel_rank() == 0 and ctx.remote_request_id is not None:
+                    try:
+                        self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
+                    except Exception:
+                        logger.exception("Failed _send_pulled_kv_req_list in TP mode for req_id=%s", req_id)
+                with self._transfer_lock:
+                    self._recving_transfers.append(ctx.request_id)
+
+            # cleanup pending and prebuilt tables
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+
+            logger.debug("Finalized req_id=%s after per-layer copies", req_id)
+            return True
+        except Exception as e:
+            logger.exception("Failed to finalize req_id=%s after per-layer copies: %s", req_id, e)
+            # if finalization failed, unset finalized flag to allow retry
+            try:
+                ctx._finalized = False
+            except Exception:
+                pass
+            return False
 
     def _h2d_worker(self):
         while not self._h2d_stop.is_set():
@@ -1311,7 +1445,7 @@ class DecodeConnectorWorker:
                     self._prebuilt_block_tables.pop(ctx.request_id, None)
                 self._h2d_q.task_done()
 
-    def _log_network_timing(self, ctx: PendingReq):
+    def _log_network_timing(self, ctx: 'PendingReq'):
         t_submit = ctx.t_submit
         t_sent = ctx.t_sent if ctx.t_sent > 0 else t_submit
         t_resp = ctx.t_resp if ctx.t_resp > 0 else time.time()
@@ -1327,7 +1461,8 @@ class DecodeConnectorWorker:
             ctx.request_id, num_blocks, cost_submit_to_send, cost_send_to_resp, cost_submit_to_resp
         )
 
-    def _post_success(self, ctx: PendingReq):
+    def _post_success(self, ctx: 'PendingReq'):
+        # unchanged full-path behavior (kept as in your original code)
         t_submit = ctx.t_submit
         t_resp = ctx.t_resp if ctx.t_resp > 0 else time.time()
 
@@ -1336,20 +1471,14 @@ class DecodeConnectorWorker:
 
         DecodeConnectorWorker._h2d_wait.wait()
         t_h2d_start = time.time()
-        block_table_ts = None
-        if hasattr(self, "_prebuilt_block_tables"):
-            block_table_ts = self._prebuilt_block_tables.pop(ctx.request_id, None)
-        # if self.h2d_stream:
-        #     with torch.npu.stream(self.h2d_stream):
-        #         self.omni_cache.synchronize_h2d(ctx.local_block_ids, CLUSTER_SIZE, block_table_ts)
-        #     compute_stream = torch.npu.current_stream()
-        #     compute_stream.wait_stream(self.h2d_stream)
-        # else:
+
+        # execute full synchronize (this may re-copy already-copied layers; acceptable but can be optimized later)
         self.omni_cache.synchronize_h2d(ctx.local_block_ids, CLUSTER_SIZE)
+
         t_h2d_end = time.time()
         logger.warning(" ***** Time cost of decode synchronize_h2d is %.3f ms (req_id:%s)",
                        (t_h2d_end - t_h2d_start) * 1000.0, ctx.request_id)
-        
+
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if tp_size == 1:
             if ctx.remote_request_id is not None:
@@ -1363,7 +1492,6 @@ class DecodeConnectorWorker:
             with self._transfer_lock:
                 self._recving_transfers.append(ctx.request_id)
 
-        
         total_cost = (time.time() - t_submit)
         logger.warning(" ***** read block total: req_id:%s, cost:%.6f s", ctx.request_id, total_cost)
 

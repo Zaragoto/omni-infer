@@ -776,6 +776,50 @@ class DecodeOmniCache(BaseOmniCache):
             self.host_cache.batch_layer_copy_to_npu(local_block_ids[0][idx_blc*blc_num_batch:end_idx],
                                                     npu_blocks[idx_blc*blc_num_batch:end_idx], device_id)
 
+
+    def synchronize_h2d_layerwise(self, local_block_ids: List[List[int]], layer_id: int = 0) -> None:
+        layer_indices = self.device_cache.keys()
+        npu_blocks = []
+        device_id = None
+        for block_id in local_block_ids[0]:
+            layers = []
+            for layer_name in layer_indices:
+                layer_idx = self.layer_indices[layer_name]
+                if layer_idx != layer_id:
+                    continue
+                if device_id is None:
+                    device_id = self.device_cache[layer_name][0][block_id].device.index
+                if model_extra_config.operator_opt_config.enable_dsa:
+                    layers.append(
+                        (
+                            # only keep k_indexer cache on device
+                            self.device_cache[layer_name][0][block_id],
+                        )
+                    )
+                else:
+                    layers.append(
+                        (
+                            self.device_cache[layer_name][0][block_id],
+                            self.device_cache[layer_name][1][block_id]
+                        )
+                    )
+            npu_blocks.append(layers)
+        # self.host_cache.batch_layer_copy_to_npu(local_block_ids[0], npu_blocks, device_id)
+        # change copy back to with max batch size to avoid out-of-range error in ACL
+        if model_extra_config.operator_opt_config.enable_dsa:
+            blc_num_batch = 50
+        else:
+            blc_num_batch = 20
+        for idx_blc in range((len(local_block_ids[0]) + blc_num_batch - 1) // blc_num_batch):
+            if (idx_blc + 1) * blc_num_batch > len(local_block_ids[0]):
+                end_idx = len(local_block_ids[0])
+            else:
+                end_idx = (idx_blc + 1) * blc_num_batch
+            self.host_cache.batch_layer_copy_to_npu(local_block_ids[0][idx_blc*blc_num_batch:end_idx],
+                                                    npu_blocks[idx_blc*blc_num_batch:end_idx], device_id,
+                                                    layer_indices=[layer_id])
+
+
     def synchronize_h2d_omni_attn(self, local_block_ids: List[List[int]]) -> None:
         if model_extra_config.operator_opt_config.enable_dsa:
             raise RuntimeError("Omni attention does not support DSV3.2 model yet.")
