@@ -92,12 +92,57 @@ public:
                     continue;
                 }
 
-                // Target buffer follows dst_ids; send src_ids to P-side server.
-                // auto bufs = bt.get_buffers(table_id, dst_ids, rank);
+                // 分层接收
+                int64_t uid = generate_uid_from_block_list(src_ids);
+                std::cerr << "[D] computed uid = " << uid << std::endl;
 
-                // auto bufs = bt.get_buffers_interleaved(table_id, dst_ids, rank);
-                auto bufs = bt.get_buffers_layerwise(table_id, dst_ids, rank);
-                // ===== [D] 打印期望接收的 buffers 大小 =====
+                co_await asio::async_write(socket,
+                    asio::buffer(&uid, sizeof(uid)),
+                    asio::use_awaitable);
+
+                int num_layers = config.num_layers;
+
+                for(int layer = 0; layer < num_layers; layer++) {
+                    auto layer_bufs = bt.get_buffers_one_layer(table_id, dst_ids, rank, layer);
+                    {
+                        size_t total_bytes = 0;
+                        for(auto &b : layer_bufs){
+                            total_bytes += boost::asio::buffer_size(b);
+                        }
+
+                        std::cerr << "[D][RECV] uid = " << uid
+                                  << " layer = " << layer
+                                  << " chunks = " << layer_bufs.size()
+                                  << " total_bytes = " << total_bytes
+                                  << std::endl;
+                    }
+
+                    try {
+                        co_await asio::async_read(socket, layer_bufs, asio::use_awaitable);
+                    } catch(std::exception &e) {
+                        std::cerr << "[D] async_read FAILED on layer "
+                                  << layer << ": " << e.what() << std::endl;
+                        throw;
+                    }
+
+                    std::cerr << "[D][RECV] layer = " <<layer
+                              << " completed" << std::endl;
+
+                    std::string layer_req_id = request_id + "#L" + std::to_string(layer);
+                    co_await upstream.async_send(
+                        boost::system::error_code{},
+                        std::make_tuple(layer_req_id, block_list_t{}),
+                        asio::use_awaitable);
+                }
+
+                std::cerr << "[D][RECV][ALL_DONE] uid = " << uid
+                          << " all layers (" << num_layers << ") received successfully."
+                          << std::endl;
+
+
+                // 非分层接收
+                /*auto bufs = bt.get_buffers_layerwise(table_id, dst_ids, rank);
+                
                 std::size_t d_total_bytes = 0;
                 std::cerr << "[D][BUF]"
                           << " dst_ids.size=" << dst_ids.size()
@@ -109,15 +154,6 @@ public:
                     std::cerr << " buf[" << i << "]=" << sz;
                 }
                 std::cerr << " total=" << d_total_bytes << std::endl;
-                
-                // for (auto id : src_ids) {
-                //     std::cout << "Request for ID:" << id << std::endl;
-                // }
-                // for (auto id : dst_ids) {
-                //     std::cout << "Save to ID:" << id << std::endl;
-                // }
-                // std::cout << "Buf size:" << bufs.size()/dst_ids.size() << std::endl;
-
 
                 for (block_id_t id : src_ids) {
                         std::cout << id << " ";
@@ -128,8 +164,6 @@ public:
                 std::cerr << "[D] computed uid = " << uid << std::endl;
                 
                 try {
-                // co_await asio::async_write(socket, asio::buffer(&uid, sizeof(uid)), asio::use_awaitable);
-                // co_await asio::async_read(socket, bufs, asio::use_awaitable);
                 co_await (asio::async_write(socket,
                               asio::buffer(&uid, sizeof(uid)),
                               asio::use_awaitable) &&
@@ -141,17 +175,7 @@ public:
                 
                 std::cerr << "[D] Receive data from P-side. Buffers count=" << bufs.size() 
                           << " first bytes=" << *(int64_t*)bufs[0].data()
-                          << std::endl;
-
-                // #ifdef CONTENT_CHECK
-                //                 for (size_t i = 0; i < src_ids.size(); i++)
-                //                 {
-                //                     int64_t *data = static_cast<int64_t *>(bufs[i].data());
-                //                     std::cerr << "Check content: " << *data << " : " << src_ids[i] << "\n";
-                //                     assert(*data == src_ids[i]);
-                //                 }
-                // #endif
-
+                          << std::endl;*/
                 global_stats_update(dst_ids.size() * bt.block_tp_size());
 
                 // return finished dst_ids
@@ -293,6 +317,23 @@ public:
     {
         while (true) {
             auto [request_id, ids] = co_await downstream.async_receive(asio::use_awaitable);
+            // 分层接收
+            auto pos = request_id.find("#L");
+            if(pos != std::string::npos && ids.empty()) {
+                std::string base_id = request_id.substr(0, pos);
+                int layer = std::stoi(request_id.substr(pos + 2));
+
+                int encoded_rank = -(layer + 1);
+
+                co_await upstream.async_send(
+                    boost::system::error_code{},
+                    std::make_tuple(base_id, encoded_rank),
+                    asio::use_awaitable
+                );
+
+                continue;
+            }
+            // 分层接收结束
 
             requests_mutex.lock();
             for (auto id : ids) {
@@ -419,6 +460,31 @@ public:
         try {
             while (true) {
                 auto [request_id, rank] = co_await downstream.async_receive(asio::use_awaitable);
+                // 分层接收
+                if(rank < 0) {
+                    int layer = -rank -1;
+
+                    requests_mutex.lock();
+                    auto it = requests_status.find(request_id);
+                    if (it == requests_status.end()) {
+                        requests_mutex.unlock();
+                        continue;
+                    }
+                    auto &[client_id, table_id, rank_finished, block_ids] = it->second;
+                    client_id_t cid = client_id;
+                    requests_mutex.unlock();
+                    
+                    std::string layer_req_id = request_id + "#L" + std::to_string(layer);
+
+                    co_await upstream.async_send(
+                        boost::system::error_code{},
+                        std::make_tuple(cid, layer_req_id, true),
+                        asio::use_awaitable
+                    );
+
+                    continue;
+                }
+                // 分层接收结束
 
                 // rank is the index within the cluster;
                 // the corresponding bit in the cluster's completion bitmap was already set when the request was logged.

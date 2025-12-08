@@ -27,13 +27,23 @@ class RouterDealerClient:
             print(f"[ERROR] Failed to send: {e}")
             return False
 
+    # def receive_response(self):
+    #     try:
+    #         frames = self.socket.recv_multipart()
+    #         responses = [msgpack.unpackb(f) for f in frames]
+    #         return responses
+    #     except Exception as e:
+    #         print(f"[ERROR] Failed to receive response: {e}")
+    #         return None
+
     def receive_response(self):
         try:
             frames = self.socket.recv_multipart()
-            responses = [msgpack.unpackb(f) for f in frames]
-            return responses
+            payload = frames[-1]
+            response = msgpack.unpackb(payload)
+            return response
         except Exception as e:
-            print(f"[ERROR] Failed to receive response: {e}")
+            print(f"[ERROR] Failed to send: {e}")
             return None
 
     def close(self):
@@ -96,13 +106,39 @@ def main():
         if req is None:
             continue
 
+        # 发送一次请求
         client.send_request(req)
 
-        print("[WAIT] 等待 ox 返回结果...")
-        resp = client.receive_response()
-        print("[RECV]", resp)
+        # 连续收这个 request 对应的所有消息（每层 + 整体完成）
+        print("[WAIT] 等待 ox 返回多条消息...")
+
+        while True:
+            resp = client.receive_response()
+            print("[RECV]", resp)
+
+            if resp is None:
+                # 收不到就继续等，不要跳回输入
+                continue
+
+            if not isinstance(resp, dict):
+                continue
+
+            req_id = resp.get("request_id")
+            if not isinstance(req_id, str):
+                continue
+
+            # 每一层完成的通知：形如 "0#L0", "0#L1" ...
+            if "#L" in req_id:
+                print(f"[LAYER DONE] {req_id}")
+                continue
+
+            # 整个 request 完成：形如 "0"
+            if req_id == req["request_id"]:
+                print("[DONE] request 完整接收")
+                break
 
     client.close()
+
 
 
 if __name__ == "__main__":
