@@ -1384,6 +1384,22 @@ class DecodeConnectorWorker:
             total_cost = [round(t_h2d_end - ctx.t_submit, 6) for (ctx, _) in ctxs]
             logger.debug(f" **** Read block Total: len(req_id): {len(ctxs)}, cost: {total_cost} s")
 
+    def _log_network_timing(self, ctx: PendingReq):
+        t_submit = ctx.t_submit
+        t_sent = ctx.t_sent if ctx.t_sent > 0 else t_submit
+        t_resp = ctx.t_resp if ctx.t_resp > 0 else time.time()
+
+        cost_submit_to_send = (t_sent - t_submit) * 1000.0
+        cost_send_to_resp = (t_resp - t_sent) * 1000.0
+        cost_submit_to_resp = (t_resp - t_submit) * 1000.0
+
+        num_blocks = len(ctx.local_block_ids[0]) if ctx.local_block_ids else 0
+        logger.warning(
+            " ***** Pull kv timing (network only): req_id:%s, num_blocks:%d, "
+            "submit->send: %.3f ms, send->resp: %.3f ms, submit->resp: %.3f ms",
+            ctx.request_id, num_blocks, cost_submit_to_send, cost_send_to_resp, cost_submit_to_resp
+        )
+
     def _post_success(self, batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs):
         """
         ctxs: list of (ctx, layer_idx) pairs
