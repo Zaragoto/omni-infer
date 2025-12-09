@@ -1171,7 +1171,7 @@ class DecodeConnectorWorker:
             )
 
         # only for debug, need to be removed after a stable version is ready
-        final_payload={
+        final_payload = {
             "request_id": request_id,
             "cluster_id": int(dst_cluster_id),
             "src_id_list": remote_block_ids,
@@ -1430,6 +1430,10 @@ class DecodeConnectorWorker:
             return False
 
     def _h2d_worker(self):
+        """
+        保留旧整请求 H2D 路径，但不再参与 per-layer 逻辑。
+        注意：这里不再 pop _pending，避免与 per-layer finalize 冲突。
+        """
         while not self._h2d_stop.is_set():
             try:
                 ctx: PendingReq = self._h2d_q.get(timeout=0.1)
@@ -1441,8 +1445,8 @@ class DecodeConnectorWorker:
             except Exception as e:
                 logger.exception("H2D worker error on req_id=%s: %s", ctx.request_id, e)
             finally:
-                with self._pending_lock:
-                    self._pending.pop(ctx.request_id, None)
+                # with self._pending_lock:
+                #     self._pending.pop(ctx.request_id, None)
                 if hasattr(self, "_prebuilt_block_tables"):
                     self._prebuilt_block_tables.pop(ctx.request_id, None)
                 self._h2d_q.task_done()
