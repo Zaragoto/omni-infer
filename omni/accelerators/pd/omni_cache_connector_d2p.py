@@ -1142,7 +1142,7 @@ class DecodeConnectorWorker:
         remote_request_id: Optional[str],
         remote_host_ip: str
     ):
-        # 仅用于调试
+        # only for debug, need to be removed after a stable version is ready
         logger.warning("\n========== PY DEBUG (_read_blocks entry) ==========")
         logger.warning(">>> PY DEBUG: sending to ox:", {
             "local_block_ids": local_block_ids,
@@ -1162,7 +1162,6 @@ class DecodeConnectorWorker:
         logger.warning("===================================================\n")
         start = time.time()
 
-        # 用 Manager().dict 存 ctx，方便子进程访问
         req = PendingReq(
             request_id=request_id,
             local_block_ids=local_block_ids,
@@ -1174,9 +1173,10 @@ class DecodeConnectorWorker:
             t_submit=start,
         )
         req.t_sent = start
+        # 注意：_pending 是 Manager().dict()
         self._pending[request_id] = req
 
-        # 仅用于调试
+        # only for debug, need to be removed after a stable version is ready
         final_payload = {
             "request_id": request_id,
             "cluster_id": int(dst_cluster_id),
@@ -1189,7 +1189,6 @@ class DecodeConnectorWorker:
         logger.warning("FINAL TYPES:", {k: type(v) for k, v in final_payload.items()})
         logger.warning("\n=========================================")
 
-        # 发送拉取指令到 ox
         self.zmq_client.send_request(
             request_id=request_id,
             cluster_id=dst_cluster_id,
@@ -1202,7 +1201,7 @@ class DecodeConnectorWorker:
                        request_id, time.time() - start)
 
     def _ensure_process_started(self):
-        # ZMQ 收发子进程
+        # ZMQ recv/send process
         if not (self._resp_process and self._resp_process.is_alive()):
             self._resp_stop.clear()
             self._resp_process = multiprocessing.Process(
@@ -1212,7 +1211,7 @@ class DecodeConnectorWorker:
             self.zmq_client = _ZMQSendProxy(self._send_q)
             logger.info("ZMQ receive process started at %s", self._endpoint)
         
-        # 构建 H2D 地址子进程
+        # H2D address building process
         if not (self._address_process and self._address_process.is_alive()):
             self._address_stop.clear()
             self._address_process = multiprocessing.Process(
@@ -1220,8 +1219,8 @@ class DecodeConnectorWorker:
             )
             self._address_process.start()
             logger.info("Address-Process started")
-
-        # H2D worker 线程
+        
+        # Monitor thread
         def monitor():
             while not self._process_monitor_stop.is_set():
                 is_alive = [self._resp_process.is_alive(), self._address_process.is_alive()]
@@ -1229,6 +1228,7 @@ class DecodeConnectorWorker:
                     logger.warning(f"[self._resp_process.is_alive(), self._address_process.is_alive()] = {is_alive}")
                 time.sleep(1)
 
+        # H2D worker thread
         if not (self._h2d_thread and self._h2d_thread.is_alive()):
             self._h2d_stop.clear()
             self._h2d_thread = threading.Thread(
@@ -1237,7 +1237,6 @@ class DecodeConnectorWorker:
             self._h2d_thread.start()
             logger.info("H2D worker thread started")
         
-        # 监控线程
         if not (self._process_monitor_thread and self._process_monitor_thread.is_alive()):
             self._process_monitor_stop.clear()
             self._process_monitor_thread = threading.Thread(
@@ -1277,11 +1276,12 @@ class DecodeConnectorWorker:
 
                 if resp is None:
                     continue
+
                 req_id = resp.get("request_id")
                 if not isinstance(req_id, str):
                     raise RuntimeError(f"Invalied responds format!")
 
-                # 解析层号
+                # parse layer tag if provided in request id
                 layer_id = None
                 if "#L" in req_id:
                     req_id, layer_part = req_id.split("#L", 1)
@@ -1298,11 +1298,14 @@ class DecodeConnectorWorker:
 
                 try:
                     if layer_id is not None:
-                        logger.warning(f"======= successfully get layer id {layer_id} for req {req_id} =======")
+                        logger.warning(
+                            "======= successfully get layer id %s for req %s =======",
+                            layer_id, req_id
+                        )
                         await asyncio.to_thread(self._recv_q.put, (req_id, layer_id))
                     else:
-                        # 不带 #L 的响应直接忽略
-                        logger.debug(f"Ignore non-layer response for req {req_id}: {resp}")
+                        # ignore non-layer responses
+                        logger.debug("Ignore non-layer response for req %s: %s", req_id, resp)
                 except asyncio.CancelledError:
                     break
 
@@ -1317,15 +1320,24 @@ class DecodeConnectorWorker:
         asyncio.run(async_main())
     
     def _process_h2d_address(self):
+        """
+        子进程：只负责根据 (req_id, layer_id) 构建 batched H2D 的地址和 host buffer，
+        不再传 ctx 对象回主进程。主进程通过 req_id 再查 ctx 做状态累积。
+        """
         while not self._address_stop.is_set():
-            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs = [], [], [], [], []
+            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes = [], [], [], []
+            ids: List[Tuple[str, Optional[int]]] = []
             start_time = time.time()
+
             while True:
                 try:
                     items = self._recv_q.get_nowait()
                     if isinstance(items, tuple):
                         req_id, layer_id = items
-                        logger.warning(f"======= in _process_h2d_address: unpack layer id {layer_id} for req {req_id} =======")
+                        logger.warning(
+                            "======= in _process_h2d_address: unpack layer id %s for req %s =======",
+                            layer_id, req_id
+                        )
                     else:
                         req_id = items
                         layer_id = None
@@ -1337,64 +1349,73 @@ class DecodeConnectorWorker:
                     ctx.t_resp = time.time()
                 if not ctx:
                     raise ValueError("Orphan response for unknown req_id=%s" % req_id)
+
                 self._log_network_timing(ctx)
 
                 if layer_id is not None:
-                    micro_batch_device_mem, micro_batch_device_max, micro_batch_host_mem, micro_batch_host_sizes = (
-                        self.omni_cache.build_h2d_ops_layerwise(
-                            ctx.local_block_ids,
-                            layer_id
-                        )
+                    mb_dev, mb_max, mb_host, mb_sizes = self.omni_cache.build_h2d_ops_layerwise(
+                        ctx.local_block_ids,
+                        layer_id
                     )
                 else:
-                    micro_batch_device_mem, micro_batch_device_max, micro_batch_host_mem, micro_batch_host_sizes = (
-                        self.omni_cache.build_h2d_ops(
-                            ctx.local_block_ids,
-                            CLUSTER_SIZE
-                        )
+                    mb_dev, mb_max, mb_host, mb_sizes = self.omni_cache.build_h2d_ops(
+                        ctx.local_block_ids,
+                        CLUSTER_SIZE
                     )
 
-                batch_device_mem.extend(micro_batch_device_mem)
-                batch_device_max.extend(micro_batch_device_max)
-                batch_host_mem.extend(micro_batch_host_mem)
-                batch_host_sizes.extend(micro_batch_host_sizes)
+                batch_device_mem.extend(mb_dev)
+                batch_device_max.extend(mb_max)
+                batch_host_mem.extend(mb_host)
+                batch_host_sizes.extend(mb_sizes)
 
-                # 存 (ctx, layer_id)，worker 逐个处理
-                ctxs.append((ctx, layer_id))
+                ids.append((req_id, layer_id))
 
-            if len(ctxs) > 0:
+            if ids:
                 logger.debug(
                     " ***** process batch copy address: len(req_id): %d, cost: %.6f s",
-                    len(ctxs), time.time() - start_time
+                    len(ids), time.time() - start_time
                 )
-                self._h2d_q.put((batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs))
+                # push only batch ops + (req_id, layer_id) list to main process
+                self._h2d_q.put((batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ids))
 
     def _h2d_worker(self):
+        """
+        主进程线程：执行 batched H2D，并基于 req_id 在主进程的 ctx 上累积 per-layer 状态。
+        """
         self.omni_cache.host_cache.ascend_cl_stream.create()
         while not self._h2d_stop.is_set():
-            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs = self._h2d_q.get()
-            layer_ids = [str(layer_idx) if layer_idx is not None else "None" for (_, layer_idx) in ctxs]
-            logger.warning(f"======= in _h2d_worker: processing layers {','.join(layer_ids)} =======")
+            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ids = self._h2d_q.get()
+            layer_ids = [str(layer_idx) if layer_idx is not None else "None" for (_, layer_idx) in ids]
+            logger.warning("======= in _h2d_worker: processing layers %s =======", ",".join(layer_ids))
             t_h2d_start = time.time()
             try:
-                self._post_success(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs)
-                logger.warning(f"======= in _h2d_worker: successfully post_process layers {','.join(layer_ids)} =======")
+                # 1. batched H2D
+                self.omni_cache.synchronize_h2d(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes)
+
+                # 2. 对每个 (req_id, layer_idx) 在主进程的 ctx 上累积状态 + finalize
+                for req_id, layer_idx in ids:
+                    ctx = self._pending.get(req_id)
+                    if not ctx:
+                        # 可能已经被 finalize 清理掉
+                        continue
+                    self._record_layer_done_and_maybe_finalize(ctx, layer_idx)
+
+                logger.warning("======= in _h2d_worker: successfully post_process layers %s =======", ",".join(layer_ids))
             except Exception as e:
                 logger.exception(
-                    "H2D worker error on req_id=%s: %s",
-                    ",".join([str(ctx.request_id) for (ctx, _) in ctxs]), e
+                    "H2D worker error on req_ids=%s: %s",
+                    ",".join([rid for (rid, _) in ids]), e
                 )
             finally:
-                # 让 _maybe_finalize 统一负责 pending 生命周期，这里不再 pop _pending
                 t_h2d_end = time.time()
                 logger.debug(
                     " **** Time cost of decode synchronize_h2d is %.3f ms len(req_id):%s",
-                    (t_h2d_end - t_h2d_start) * 1000.0, len(ctxs)
+                    (t_h2d_end - t_h2d_start) * 1000.0, len(ids)
                 )
-                total_cost = [round(t_h2d_end - ctx.t_submit, 6) for (ctx, _) in ctxs]
+                # t_submit 只能从 ctx 再查，这里只保留总时间日志
                 logger.debug(
-                    " **** Read block Total: len(req_id): %d, cost:%s s",
-                    len(ctxs), total_cost
+                    " **** Read block Total: len(req_id): %d, batch_cost:%.6f s",
+                    len(ids), t_h2d_end - t_h2d_start
                 )
 
     def _log_network_timing(self, ctx: PendingReq):
@@ -1413,59 +1434,54 @@ class DecodeConnectorWorker:
             ctx.request_id, num_blocks, cost_submit_to_send, cost_send_to_resp, cost_submit_to_resp
         )
 
-    def _post_success(self, batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs):
+    def _record_layer_done_and_maybe_finalize(self, ctx: 'PendingReq', layer_idx: Optional[int]):
         """
-        ctxs: list of (ctx, layer_idx) pairs
+        在主进程里对 ctx 累积 per-layer 状态，然后尝试 finalize。
         """
-        if self.omni_cache is None or self.omni_cache.device_cache is None:
-            raise RuntimeError("Error! omni_cache is None or device_cache is None.")
+        if not hasattr(ctx, "_layers_done") or ctx._layers_done is None:
+            ctx._layers_done = set()
 
-        # batched H2D
-        self.omni_cache.synchronize_h2d(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes)
-
-        # 逐个 ctx / layer 处理计数与 finalize
-        for ctx, layer_idx in ctxs:
-            if not hasattr(ctx, "_layers_done") or ctx._layers_done is None:
-                ctx._layers_done = set()
-
-            if layer_idx is None:
-                # 全拷场景：直接认为所有层已完成
-                ctx._layers_done = set(range(self.omni_cache.num_layers))
-                logger.warning(f"======= done h2d full-copy for req {ctx.request_id} ======")
+        if layer_idx is None:
+            # full copy: mark all layers done
+            ctx._layers_done = set(range(self.omni_cache.num_layers))
+            ctx._layers_total = self.omni_cache.num_layers
+            ctx._max_layer_seen = self.omni_cache.num_layers - 1
+            logger.warning("======= done h2d full-copy for req %s ======", ctx.request_id)
+        else:
+            ctx._layers_done.add(layer_idx)
+            logger.warning("======= done h2d copy for layer %s req %s ======", layer_idx, ctx.request_id)
+            if not hasattr(ctx, "_layers_total") or ctx._layers_total is None:
                 ctx._layers_total = self.omni_cache.num_layers
+            if not hasattr(ctx, "_max_layer_seen") or ctx._max_layer_seen is None:
+                ctx._max_layer_seen = layer_idx
             else:
-                ctx._layers_done.add(layer_idx)
-                logger.warning(f"======= done h2d copy for layer {layer_idx} req {ctx.request_id} ======")
-                if not hasattr(ctx, "_layers_total") or ctx._layers_total is None:
-                    ctx._layers_total = self.omni_cache.num_layers
+                ctx._max_layer_seen = max(ctx._max_layer_seen, layer_idx)
 
-            # 每次层完成都尝试 finalize
-            self._maybe_finalize(ctx)
+        self._maybe_finalize(ctx)
 
     def _maybe_finalize(self, ctx: 'PendingReq'):
         """
-        所有层 H2D 完成后：
+        如果当前 request 已经对“见过的所有层”完成了 H2D，则：
         - 发送 pulled kv req list（如有 remote_request_id）
-        - 把 request_id 放到 _recving_transfers
-        - 从 _pending 中删除 ctx
-
-        假设：P 侧和 ox 确实对所有 0..num_layers-1 层都返回了响应。
+        - 把 request_id 放进 _recving_transfers（供 get_finished 使用）
+        - 从 _pending 删除 ctx
         """
         req_id = getattr(ctx, "request_id", None)
         if req_id is None:
             return False
 
-        total_layers = getattr(ctx, "_layers_total", None)
         layers_done = getattr(ctx, "_layers_done", set())
+        max_layer_seen = getattr(ctx, "_max_layer_seen", None)
 
-        if total_layers is None:
-            return False
         if not isinstance(layers_done, (set, list)):
             return False
-
-        if len(layers_done) < total_layers:
-            # 还没集齐所有层
+        if max_layer_seen is None:
             return False
+
+        # 要求 [0..max_layer_seen] 全部在 layers_done 里
+        for lid in range(max_layer_seen + 1):
+            if lid not in layers_done:
+                return False
 
         if getattr(ctx, "_finalized", False):
             return True
@@ -1492,15 +1508,15 @@ class DecodeConnectorWorker:
                 with self._transfer_lock:
                     self._recving_transfers.put(ctx.request_id)
 
-            # 这里统一清理 _pending 中的 ctx
+            # cleanup pending
             try:
                 self._pending.pop(req_id, None)
             except Exception:
                 pass
 
             logger.debug(
-                "Finalized req_id=%s after per-layer copies, layers_done=%s / total=%s",
-                req_id, sorted(list(layers_done)), total_layers
+                "Finalized req_id=%s after per-layer copies, layers_done=%s, max_layer_seen=%s",
+                req_id, sorted(list(layers_done)), max_layer_seen
             )
             return True
         except Exception as e:
