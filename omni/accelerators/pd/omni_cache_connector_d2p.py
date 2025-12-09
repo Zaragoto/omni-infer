@@ -1377,12 +1377,12 @@ class DecodeConnectorWorker:
                     " ***** process batch copy address: len(req_id): %d, cost: %.6f s",
                     len(ids), time.time() - start_time
                 )
-                # 不再传 ctx 对象，只传 req_id/layer_id + batched buffers
+                # 不传 ctx，只传 req_id/layer_id + batched buffers
                 self._h2d_q.put((batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ids))
 
     def _h2d_worker(self):
         """
-        主进程线程：执行 batched H2D，并在主进程自己的 ctx 上累积 per-layer 状态。
+        主进程线程：执行 batched H2D，并在主进程自己的 _layer_state 上累积 per-layer 状态。
         只有在 self.omni_cache.num_layers 所有层都完成时，才触发 finalize。
         """
         self.omni_cache.host_cache.ascend_cl_stream.create()
@@ -1395,13 +1395,14 @@ class DecodeConnectorWorker:
                 # 1. batched H2D 拷贝
                 self.omni_cache.synchronize_h2d(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes)
 
-                # 2. 对每个 (req_id, layer_idx) 在主进程的 ctx 上累积状态 + 尝试 finalize
+                # 2. 累积 per-layer 状态并尝试 finalize
                 for req_id, layer_idx in ids:
+                    # ctx 用于 log / 结束后清理 pending
                     ctx = self._pending.get(req_id)
                     if not ctx:
                         # 可能已经被 finalize 清掉
                         continue
-                    self._record_layer_done_and_maybe_finalize(ctx, layer_idx)
+                    self._record_layer_done_and_maybe_finalize(req_id, ctx, layer_idx)
 
                 logger.warning("======= in _h2d_worker: successfully post_process layers %s =======", ",".join(layer_ids))
             except Exception as e:
@@ -1415,7 +1416,6 @@ class DecodeConnectorWorker:
                     " **** Time cost of decode synchronize_h2d is %.3f ms len(req_id):%s",
                     (t_h2d_end - t_h2d_start) * 1000.0, len(ids)
                 )
-                # 如果需要 per-ctx total_cost，可在这里再查一次 _pending[req_id] 里的 t_submit
 
     def _log_network_timing(self, ctx: PendingReq):
         t_submit = ctx.t_submit
@@ -1433,47 +1433,45 @@ class DecodeConnectorWorker:
             ctx.request_id, num_blocks, cost_submit_to_send, cost_send_to_resp, cost_submit_to_resp
         )
 
-    def _record_layer_done_and_maybe_finalize(self, ctx: 'PendingReq', layer_idx: Optional[int]):
+    def _record_layer_done_and_maybe_finalize(self, req_id: str, ctx: 'PendingReq', layer_idx: Optional[int]):
         """
-        在主进程的 ctx 上累积 per-layer 状态，然后基于“所有 num_layers 层必须完成”的规则尝试 finalize。
+        在主进程的 _layer_state[req_id] 中累积 per-layer 状态，然后基于“所有 num_layers 层必须完成”的规则尝试 finalize。
         """
-        if not hasattr(ctx, "_layers_done") or ctx._layers_done is None:
-            ctx._layers_done = set()
-
         num_layers = self.omni_cache.num_layers
+
+        # 初始化该 req_id 的状态集合
+        s = self._layer_state.get(req_id)
+        if s is None:
+            s = set()
+            self._layer_state[req_id] = s
 
         if layer_idx is None:
             # full copy: 直接认为所有层 done
-            ctx._layers_done = set(range(num_layers))
-            logger.warning("======= done h2d full-copy for req %s ======", ctx.request_id)
+            s.clear()
+            s.update(range(num_layers))
+            logger.warning("======= done h2d full-copy for req %s ======", req_id)
         else:
-            ctx._layers_done.add(layer_idx)
-            logger.warning("======= done h2d copy for layer %s req %s ======", layer_idx, ctx.request_id)
+            s.add(layer_idx)
+            logger.warning("======= done h2d copy for layer %s req %s, layers_done_now=%s ======",
+                           layer_idx, req_id, sorted(list(s)))
 
-        # 严格语义：所有 0..(num_layers-1) 层都必须出现在 _layers_done 里
-        self._maybe_finalize(ctx, num_layers)
+        # 严格语义：所有 0..(num_layers-1) 层都必须出现在 s 里
+        self._maybe_finalize(req_id, ctx, s, num_layers)
 
-    def _maybe_finalize(self, ctx: 'PendingReq', num_layers: int):
+    def _maybe_finalize(self, req_id: str, ctx: 'PendingReq', layers_done: set[int], num_layers: int):
         """
-        只有当 0..(num_layers-1) 所有层都在 ctx._layers_done 中时，
+        只有当 0..(num_layers-1) 所有层都在 layers_done 中时，
         才触发：
         - _send_pulled_kv_req_list
         - _recving_transfers.put
         - _pending.pop
         """
-        req_id = getattr(ctx, "request_id", None)
-        if req_id is None:
-            return False
-
-        layers_done = getattr(ctx, "_layers_done", set())
-        if not isinstance(layers_done, (set, list)):
-            return False
-
         # 必须 0..num_layers-1 全部完成
         for lid in range(num_layers):
             if lid not in layers_done:
                 return False
 
+        # 防止重复 finalize，同一个 req_id 只执行一次
         if getattr(ctx, "_finalized", False):
             return True
 
@@ -1499,11 +1497,12 @@ class DecodeConnectorWorker:
                 with self._transfer_lock:
                     self._recving_transfers.put(ctx.request_id)
 
-            # 完成后从 pending 清理
+            # 完成后清理 pending 和 layer_state
             try:
                 self._pending.pop(req_id, None)
             except Exception:
                 pass
+            self._layer_state.pop(req_id, None)
 
             logger.debug(
                 "Finalized req_id=%s after per-layer copies, layers_done=%s / num_layers=%s",
