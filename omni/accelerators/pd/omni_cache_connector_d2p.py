@@ -993,6 +993,8 @@ class DecodeConnectorWorker:
         self._mgr = multiprocessing.Manager()
         self._pending = self._mgr.dict()
 
+        self._layer_state: Dict[str, set[int]] = {}
+
         # self.h2d_stream = torch.npu.Stream()
 
     def on_fast_path_req(self):
