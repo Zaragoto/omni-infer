@@ -828,7 +828,7 @@ class DecodeOmniCache(BaseOmniCache):
                         )
                     )
             npu_blocks.append(layers)
-            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes = self.host_cache.batch_layer_copy_to_npu(local_block_ids[0], npu_blocks, layer_indices=[layer_id])
+        batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes = self.host_cache.batch_layer_copy_to_npu(local_block_ids[0], npu_blocks, layer_indices=[layer_id])
         
         return batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes
 
