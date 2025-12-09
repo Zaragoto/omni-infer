@@ -75,8 +75,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 400
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.5
@@ -165,8 +165,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 400
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.5
@@ -255,8 +255,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 400
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.5
@@ -345,8 +345,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 400
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.5
@@ -395,10 +395,10 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 32768
+              max-num-batched-tokens: 33792
               max-num-seqs: 16
               no-enable-prefix-caching: ''
-              long-prefill-token-threshold: 32768
+              long-prefill-token-threshold: 33792
             gpu-util: '0.92'
             kv-transfer-config:
               engine_id: 0
@@ -436,8 +436,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 50
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.1
@@ -486,10 +486,10 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 32768
+              max-num-batched-tokens: 33792
               max-num-seqs: 16
               no-enable-prefix-caching: ''
-              long-prefill-token-threshold: 32768
+              long-prefill-token-threshold: 33792
             gpu-util: '0.92'
             kv-transfer-config:
               engine_id: 0
@@ -527,8 +527,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 50
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.1
@@ -577,10 +577,10 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 32768
+              max-num-batched-tokens: 33792
               max-num-seqs: 16
               no-enable-prefix-caching: ''
-              long-prefill-token-threshold: 32768
+              long-prefill-token-threshold: 33792
             gpu-util: '0.92'
             kv-transfer-config:
               engine_id: 1
@@ -618,8 +618,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 50
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.3
@@ -668,10 +668,10 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 32768
+              max-num-batched-tokens: 33792
               max-num-seqs: 16
               no-enable-prefix-caching: ''
-              long-prefill-token-threshold: 32768
+              long-prefill-token-threshold: 33792
             gpu-util: '0.92'
             kv-transfer-config:
               engine_id: 1
@@ -709,8 +709,8 @@ all:
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 50
-            HCCL_CONNECT_TIMEOUT: 600
-            HCCL_EXEC_TIMEOUT: 600
+            HCCL_CONNECT_TIMEOUT: 1800
+            HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
             HCCL_INTRA_ROCE_ENABLE: 1
             HOST_IP: 127.0.0.3

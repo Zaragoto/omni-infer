@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 
 # seconds, used to free blocks after a delay once the request is finished
 BLOCK_RELEASE_DELAY = 3000
-PER_REQUEST_CONNECTION = 1
+PER_REQUEST_CONNECTION = 4
 
 BASE_DIR = os.path.dirname(__file__)
 OX_PATH = os.environ.get("OX_PATH", os.path.join(BASE_DIR, "ox2/ox")) # call the ox for layerwise kv transfer
@@ -459,6 +459,7 @@ class PrefillConnectorScheduler:
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
         # get block ids from blocks
+        logger.warning(f"====== {request=}: kv blocks from update_state_after_alloc : {blocks.get_block_ids()} ======")
         block_ids = blocks.get_block_ids()[0]
         spec_token_ids = []
         # the payload for pull kv metadata should be sent to decode side immediately after allocation
@@ -700,7 +701,7 @@ class PrefillConnectorWorker:
                     packed = msgpack.packb(cmd)
                     try:
                         self.sock_layer.send(packed, zmq.NOBLOCK)
-                        logger.warning(f"[ZMQ controller] sent layer {layer_idx} to ox server for blocks: {block_table}")
+                        logger.warning(f"[ZMQ controller] sent layer {layer_idx} to ox server for {block_table}")
                     except Exception as e:
                         logger.warning("[ZMQ controller] failed to send:", e)
                         break
@@ -925,7 +926,7 @@ class DecodeConnectorScheduler:
 class DecodeConnectorWorker:
     """Worker implementation for datadist (decode)."""
 
-    _h2d_wait = threading.Event()
+    # _h2d_wait = threading.Event()
 
     def __init__(self, vllm_config: "VllmConfig", host_ip: str, cluster_id_start: int):
         self.vllm_config = vllm_config
@@ -1134,6 +1135,7 @@ class DecodeConnectorWorker:
         remote_host_ip: str
     ):
         # only for debug, need to be removed after a stable version is ready
+        logger.warning(f"++++++ {local_block_ids=}; {remote_block_ids=}; {dst_cluster_id=}; {request_id=}; {remote_request_id=}; {remote_host_ip=} ++++++")
         logger.warning("\n========== PY DEBUG (_read_blocks entry) ==========")
         logger.warning(">>> PY DEBUG: sending to ox:", {
             "local_block_ids": local_block_ids,
@@ -1153,6 +1155,7 @@ class DecodeConnectorWorker:
         logger.warning("===================================================\n")
         start = time.time()
 
+        logger.warning(" ***** AAAA read block-send request: req_id:%s", request_id)
         self._ensure_resp_thread_started()
 
         with self._pending_lock:
@@ -1179,6 +1182,8 @@ class DecodeConnectorWorker:
         logger.warning(final_payload)
         logger.warning("FINAL TYPES:", {k: type(v) for k, v in final_payload.items()})
         logger.warning("\n=========================================")
+
+        logger.warning(" ***** Before read block-send request: req_id:%s", request_id)
 
         self.zmq_client.send_request(
             request_id=request_id,
@@ -1233,7 +1238,7 @@ class DecodeConnectorWorker:
                         with self._pending_lock:
                             self._pending.pop(item.request_id, None)
                     else:
-                        logger.debug("Sent req_id=%s in %.6f s", item.request_id, time.time() - t0)
+                        logger.warning("Sent req_id=%s in %.6f s", item.request_id, time.time() - t0)
                     self._send_q.task_done()
 
                 resp = client.receive_response(timeout=50)
@@ -1268,8 +1273,6 @@ class DecodeConnectorWorker:
 
                 if not ctx:
                     logger.warning("Orphan response for unknown req_id=%s", req_id)
-                    if hasattr(self, "_prebuilt_block_tables"):
-                        self._prebuilt_block_tables.pop(req_id, None)
                     continue
 
                 # keep original timing log
@@ -1279,12 +1282,10 @@ class DecodeConnectorWorker:
                     logger.error("Failed to pull kv for request %s", req_id)
                     with self._pending_lock:
                         self._pending.pop(req_id, None)
-                    if hasattr(self, "_prebuilt_block_tables"):
-                        self._prebuilt_block_tables.pop(req_id, None)
                     continue
                 else:
-                    if layer_id:
-                        logger.warning(f"======= done ox pull kv for layer {layer_id} ======")
+                    if layer_id is not None and layer_id >= 0:
+                        logger.warning(f"======= done ox pull kv for layer {layer_id} for req {req_id} ======")
 
                 # - If this response contains a layer tag (#L<layer>), do per-layer H2D and track progress.
                 # - If there's no layer tag, IGNORE it (per your request).
@@ -1314,7 +1315,7 @@ class DecodeConnectorWorker:
         This function does the synchronous synchronize_h2d for the single layer.
         """
         # Wait for any global H2D precondition as in full _post_success
-        DecodeConnectorWorker._h2d_wait.wait()
+        # DecodeConnectorWorker._h2d_wait.wait()
         t_h2d_start = time.time()
 
         # Extract per-layer block ids from ctx.local_block_ids
@@ -1435,6 +1436,7 @@ class DecodeConnectorWorker:
             except queue.Empty:
                 continue
             try:
+                # Existing full-path behavior (unchanged)
                 self._post_success(ctx)
             except Exception as e:
                 logger.exception("H2D worker error on req_id=%s: %s", ctx.request_id, e)
@@ -1469,7 +1471,7 @@ class DecodeConnectorWorker:
         if self.omni_cache is None or self.omni_cache.device_cache is None:
             raise RuntimeError("Error! omni_cache is None or device_cache is None.")
 
-        DecodeConnectorWorker._h2d_wait.wait()
+        # DecodeConnectorWorker._h2d_wait.wait()
         t_h2d_start = time.time()
 
         # execute full synchronize (this may re-copy already-copied layers; acceptable but can be optimized later)
@@ -1498,7 +1500,7 @@ class DecodeConnectorWorker:
     def stop_zmq_thread(self, wait: bool = True):
         self._resp_stop.set()
         self._h2d_stop.set()
-        DecodeConnectorWorker._h2d_wait.set()
+        # DecodeConnectorWorker._h2d_wait.set()
         if self._resp_thread and wait:
             self._resp_thread.join(timeout=2.0)
         if self._h2d_thread and wait:

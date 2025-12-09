@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import os
 
 os.environ["VLLM_PLUGINS"] = ""
-os.environ["RAYON_NUM_THREADS"] = os.environ.get("RAYON_NUM_THREADS", "2")
+os.environ["RAYON_NUM_THREADS"] = os.environ.get("RAYON_NUM_THREADS", "4")
 os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get("TOKENIZERS_PARALLELISM", "true")
 os.environ["RAYON_MIN_CHUNK_SIZE"] = os.environ.get("RAYON_MIN_CHUNK_SIZE", "1024")
 
@@ -19,11 +19,18 @@ print(f"Using {os.environ['PYTHONHASHSEED']} for block hash seed")
 print(f"Using {os.environ['RAYON_NUM_THREADS']} threads for Rayon parallelism")
 print(f"Tokenizers parallelism set to: {os.environ['TOKENIZERS_PARALLELISM']}")
 print(f"Rayon minimum chunk size: {os.environ['RAYON_MIN_CHUNK_SIZE']}")
+OMNI_CHUNK_TOKENIZE = os.environ.get("OMNI_CHUNK_TOKENIZE", "true").lower() == "true"
 
 from transformers import PreTrainedTokenizer, AutoTokenizer
-# from vllm.transformers_utils.tokenizer import get_tokenizer
-# from vllm.utils import sha256
-# from vllm.v1.core import kv_cache_utils
+try:
+    from tokenizers_chunk_ext import ChunkTokenizer
+    ct: Optional[ChunkTokenizer] = None
+
+except ImportError:
+    ChunkTokenizer = None
+    print("tokenizers_chunk_ext not installed，chunk tokenize will not be used")
+
+tokenizer: PreTrainedTokenizer = None
 
 @dataclass
 class PreprocessResult:
@@ -521,7 +528,7 @@ def _preprocess_chat_batch(
         # Apply chat template exactly as vLLM does
         prompt = _apply_chat_template(
             tokenizer, processed_messages, add_generation_prompt, tools, tool_choice, multi_modal_data
-        )
+        )        
         formatted_prompts.append(prompt)
         multi_modal_data_list.append(multi_modal_data)
         
@@ -532,40 +539,54 @@ def _preprocess_chat_batch(
             input_ids=[],
             multi_modal_data=multi_modal_data
         ))
-    
-    # Phase 2: Batch tokenization (where we gain performance)
-    try:
-        # Use optimized batch tokenization with multi-modal support
-        all_input_ids = _tokenize_batch_optimized(
-            tokenizer, 
-            formatted_prompts, 
-            multi_modal_data_list
-        )
+    # whether use chunk
+    can_fast = getattr(tokenizer, "is_fast", False)
+    has_mm = any(mm is not None for mm in multi_modal_data_list)
+    use_chunk_path = OMNI_CHUNK_TOKENIZE and ChunkTokenizer and can_fast and not has_mm
+
+    if not use_chunk_path:
+        try:
+            # Use optimized batch tokenization with multi-modal support
+            all_input_ids = _tokenize_batch_optimized(
+                tokenizer, 
+                formatted_prompts, 
+                multi_modal_data_list
+            )
         
-        # Assign tokenized results
-        for i, input_ids in enumerate(all_input_ids):
-            model_name = requests[i].get("model", "")
-            if "deepseek" in model_name.lower():
-                if input_ids and len(input_ids) > 0:
+            # Assign tokenized results
+            for i, input_ids in enumerate(all_input_ids):
+                model_name = requests[i].get("model", "")
+                if "deepseek" in model_name.lower() and input_ids and len(input_ids) > 0:
                     input_ids = input_ids[1:]
-            results[i].input_ids = input_ids
-            
-    except Exception as e:
-        # Fallback to individual tokenization if batch fails
-        print(f"Batch tokenization failed, falling back to individual: {e}")
-        for i, (prompt, mm_data) in enumerate(zip(formatted_prompts, multi_modal_data_list)):
-            if mm_data and hasattr(tokenizer, 'encode_with_images'):
-                results[i].input_ids = tokenizer.encode_with_images(
-                    prompt, 
-                    images=mm_data,
-                    add_special_tokens=True
-                )
-            else:
-                results[i].input_ids = tokenizer.encode(prompt, add_special_tokens=True)
-    
+                results[i].input_ids = input_ids
+
+        except Exception as e:
+            # Fallback to individual tokenization if batch fails
+            print(f"Batch tokenization failed, falling back to individual: {e}")
+            for i, (prompt, mm_data) in enumerate(zip(formatted_prompts, multi_modal_data_list)):
+                if mm_data and hasattr(tokenizer, 'encode_with_images'):
+                    results[i].input_ids = tokenizer.encode_with_images(
+                        prompt, 
+                        images=mm_data,
+                        add_special_tokens=True
+                    )
+                else:
+                    results[i].input_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        return results
+
+    ids_no_sp_list, _ = ct.encode_batch_interleaved_with_stats(formatted_prompts, bytes_per_segment=32768, parallel=True)
+    all_input_ids = []
+    for i, ids in enumerate(ids_no_sp_list):
+        ids = tokenizer.build_inputs_with_special_tokens(ids)
+        model_name = "deepseek"  
+        if "deepseek" in model_name.lower() and ids:
+            ids = ids[1:]
+        all_input_ids.append(ids)
+    for i in range(len(results)):
+        results[i].input_ids = all_input_ids[i]
+
     return results
 
-tokenizer: PreTrainedTokenizer = None
 
 def init_tokenizer(model_path: str) -> int:
     """
@@ -578,7 +599,10 @@ def init_tokenizer(model_path: str) -> int:
         int: 0 for success, -1 for error
     """
     global tokenizer
+    global ct
     try:
+        if OMNI_CHUNK_TOKENIZE and ChunkTokenizer is not None:
+            ct = ChunkTokenizer(model_path+"/tokenizer.json")
         tokenizer = load_tokenizer(model_path)
         return 0
     except Exception as e:
@@ -698,7 +722,6 @@ if __name__ == "__main__":
         print(f"Multi-modal data found: {any(multi_modal_data)}")
 
         for prompt, ids, block_hash, mm_data in zip(prompts, input_ids, block_hashes, multi_modal_data):
-            # print(f"Conversation: {conv}")
             print(f"Prompt: {prompt}")
             print(f"  Input IDs ({len(ids)}): {ids}")
             print(f"  Block Hashes ({len(ids)}): {block_hash}")

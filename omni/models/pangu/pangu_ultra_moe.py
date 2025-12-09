@@ -18,6 +18,7 @@ import copy
 import itertools
 from typing import Iterable, List, Optional, Set, Tuple, Union
 import torch
+import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
 import torch.distributed as dist
@@ -215,7 +216,7 @@ class PanguUltraMoEDecoderLayer(nn.Module):
         is_prefill = attn_metadata is None or attn_metadata.prefill is not None
         enable_superkernel = not is_prefill and model_extra_config.operator_opt_config.use_super_kernel
 
-        with ConditionalTNGScope(super_kernel=(enable_superkernel and model_extra_config.operator_opt_config.use_mlaprolog), scope=self.self_attn.prefix):
+        with ConditionalTNGScope(super_kernel=enable_superkernel, scope='superkernel_decode_layer'):
             # Self Attention
             if residual is None:
                 residual = hidden_states
@@ -233,63 +234,57 @@ class PanguUltraMoEDecoderLayer(nn.Module):
                 attn_metadata=attn_metadata,
             )
 
-        if enable_superkernel:
-            with tng.scope.super_kernel(self.self_attn.prefix, 'stream-fusion=1'):
-                hidden_states = self.post_attention_layernorm(hidden_states)
-                hidden_states, residual = self.pre_mlp_layernorm(hidden_states, residual)
+            if model_extra_config.operator_opt_config.use_prefetch and model_extra_config.operator_opt_config.dense_mlp_prefetch > 0:
+                if self.is_moe:
+                    torch_npu.npu_prefetch(self.mlp.gate.weight, hidden_states, model_extra_config.operator_opt_config.dense_mlp_prefetch * 1024 * 1024)
+                elif model_extra_config.parall_config.dense_mlp_tp_size > 1:
+                    torch_npu.npu_prefetch(self.mlp.gate_up_proj.weight, hidden_states, model_extra_config.operator_opt_config.dense_mlp_prefetch * 1024 * 1024)
 
-                if self.is_moe == True:
-                    # omni placement do not support super kernel
-                    hidden_states, residual = self.mlp(hidden_states, residual, attn_metadata, layer_id, next_attention_weights)
-                    if isinstance(hidden_states, (tuple, list)):
-                        assert len(hidden_states) == 2
-                        hidden_states = hidden_states[0] + hidden_states[1]
-                else:
-                    hidden_states, residual = self.mlp(hidden_states, residual, attn_metadata)
-
-                hidden_states = self.post_mlp_layernorm(hidden_states)
-                if next_input_layernorm is not None:
-                    hidden_states, residual = next_input_layernorm(
-                        hidden_states, residual, quant_symbol=(not model_extra_config.operator_opt_config.use_mlaprolog and self.quant_symbol))
-        else:
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states, residual = self.pre_mlp_layernorm(hidden_states, residual)
 
-            # Perform full hidden splitting to avoid OOM
-            if (get_dp_group().world_size > 1 or PanguUltraMoEDecoderLayer.is_split_hidden_states) and is_prefill:
-                reduce_length = torch.tensor(hidden_states.shape[0], dtype=torch.int64, device=current_platform.device_type)
-                local_length = hidden_states.shape[0]
-                # global_max_length = torch.tensor(0, dtype=torch.int64)
-                dist.all_reduce(reduce_length, op=dist.ReduceOp.MAX, async_op=False)
-                global_max_length = reduce_length.item()
-                pad_size = global_max_length - hidden_states.shape[0]
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states, (0, 0, 0, pad_size)
-                )
-                residual = torch.nn.functional.pad(
-                    residual, (0, 0, 0, pad_size)
-                )
-                hidden_states_list = hidden_states.split(SEQ_SPLIT_LENGTH_BEFORE_ALL_GATHER)
-                residual_list = residual.split(SEQ_SPLIT_LENGTH_BEFORE_ALL_GATHER)
-                hidden_state_out = []
-                residual_out = []
-                for i in range(len(hidden_states_list)):
-                    hidden_states, residual = self.mlp(hidden_states_list[i], residual_list[i], attn_metadata, layer_id)
-                    hidden_state_out.append(hidden_states)
-                    residual_out.append(residual)
-                hidden_states = torch.cat(hidden_state_out)[:local_length]
-                residual = torch.cat(residual_out)[:local_length]
-            else:
-                if self.is_moe == True:
+        if (get_dp_group().world_size > 1 or PanguUltraMoEDecoderLayer.is_split_hidden_states) and is_prefill:
+            reduce_length = torch.tensor(hidden_states.shape[0], dtype=torch.int64, device=current_platform.device_type)
+            local_length = hidden_states.shape[0]
+            # global_max_length = torch.tensor(0, dtype=torch.int64)
+            dist.all_reduce(reduce_length, op=dist.ReduceOp.MAX, async_op=False)
+            global_max_length = reduce_length.item()
+            pad_size = global_max_length - hidden_states.shape[0]
+            hidden_states = torch.nn.functional.pad(
+                hidden_states, (0, 0, 0, pad_size)
+            )
+            residual = torch.nn.functional.pad(
+                residual, (0, 0, 0, pad_size)
+            )
+            hidden_states_list = hidden_states.split(SEQ_SPLIT_LENGTH_BEFORE_ALL_GATHER)
+            residual_list = residual.split(SEQ_SPLIT_LENGTH_BEFORE_ALL_GATHER)
+            hidden_state_out = []
+            residual_out = []
+            for i in range(len(hidden_states_list)):
+                hidden_states, residual = self.mlp(hidden_states_list[i], residual_list[i], attn_metadata, layer_id)
+                hidden_state_out.append(hidden_states)
+                residual_out.append(residual)
+            hidden_states = torch.cat(hidden_state_out)[:local_length]
+            residual = torch.cat(residual_out)[:local_length]
+            hidden_states = self.post_mlp_layernorm(hidden_states)
+        else:
+            if self.is_moe == True:
+                with ConditionalTNGScope(super_kernel=enable_superkernel and model_extra_config.parall_config.redundancy_shared_expert_num > 0, 
+                                         scope='superkernel_decode_layer'):
                     # omni placement do not support super kernel
                     hidden_states, residual = self.mlp(hidden_states, residual, attn_metadata, layer_id, next_attention_weights)
                     if isinstance(hidden_states, (tuple, list)):
                         assert len(hidden_states) == 2
                         hidden_states = hidden_states[0] + hidden_states[1]
-                else:
+            else:
+                with ConditionalTNGScope(super_kernel=enable_superkernel, scope='superkernel_decode_layer'):
                     hidden_states, residual = self.mlp(hidden_states, residual, attn_metadata)
 
-            hidden_states = self.post_mlp_layernorm(hidden_states)
+            with ConditionalTNGScope(super_kernel=enable_superkernel, scope='superkernel_decode_layer'):
+                hidden_states = self.post_mlp_layernorm(hidden_states)
+                if enable_superkernel and next_input_layernorm is not None:
+                    hidden_states, residual = next_input_layernorm(
+                        hidden_states, residual, quant_symbol=(not model_extra_config.operator_opt_config.use_mlaprolog and self.quant_symbol))
             
         return hidden_states, residual
 
@@ -415,7 +410,8 @@ class PanguUltraMoEModel(nn.Module):
             kv_caches: List[torch.Tensor],
             attn_metadata: AttentionMetadata,
             intermediate_tensors: Optional[IntermediateTensors],
-            max_num_tokens=None
+            max_num_tokens=None,
+            lm_head=None
     ) -> Union[torch.Tensor, IntermediateTensors]:
         attn_metadata_first = self.get_layer_attn_metadata(attn_metadata, 0)
         if model_extra_config.operator_opt_config.enable_prefill_micro_batch and \
@@ -424,7 +420,7 @@ class PanguUltraMoEModel(nn.Module):
             len(attn_metadata_first.prefill.seq_lens) > 1:
             return self.forward_micro_batch(input_ids, positions, kv_caches, attn_metadata, intermediate_tensors, max_num_tokens)
         else:
-            return self.forward_normal(input_ids, positions, kv_caches, attn_metadata, intermediate_tensors)
+            return self.forward_normal(input_ids, positions, kv_caches, attn_metadata, intermediate_tensors, lm_head)
 
     def forward_normal(
             self,
@@ -433,6 +429,7 @@ class PanguUltraMoEModel(nn.Module):
             kv_caches: List[torch.Tensor],
             attn_metadata: AttentionMetadata,
             intermediate_tensors: Optional[IntermediateTensors],
+            lm_head=None
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             hidden_states = self.get_input_embeddings(input_ids)
@@ -482,6 +479,9 @@ class PanguUltraMoEModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
 
         hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+
+        if model_extra_config.operator_opt_config.use_prefetch and model_extra_config.operator_opt_config.lm_head_prefetch > 0 and lm_head is not None:
+            torch_npu.npu_prefetch(lm_head.weight, hidden_states, model_extra_config.operator_opt_config.lm_head_prefetch * 1024 * 1024)
 
         return hidden_states
 
@@ -779,7 +779,7 @@ class PanguUltraMoEForCausalLM(nn.Module):
                                    attn_metadata, intermediate_tensors)
         else:
             hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors, self.max_num_token)
+                                   attn_metadata, intermediate_tensors, self.max_num_token, self.lm_head)
 
         if attn_metadata is None:
             logits = self.compute_lmhead(hidden_states[-1:, ...], None)

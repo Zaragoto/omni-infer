@@ -23,6 +23,7 @@ import shlex
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+import concurrent.futures
 
 from typing import Dict, Any, List, Tuple, Optional
 from omni_cli.config_transform import transform_deployment_config
@@ -39,6 +40,7 @@ from omni_cli.omni_cfg import cfg_set_process
 from omni_cli.omni_cfg import cfg_delete_process
 from omni_cli.omni_inspect import print_node_config
 from omni_cli.omni_run import create_run_parser
+from omni_cli.service_check import print_node_list
 
 INFO    = "\033[92m[INFO]\033[0m"      # green
 WARNING = "\033[93m[WARNING]\033[0m"   # yellow
@@ -464,8 +466,7 @@ def omni_cli_start(
     entry_py: str = "start_api_servers.py",
     skip_verify_config: bool = False,
     dev: bool = False,
-    proxy_only: bool = False,
-    skip_process_nz_config = False
+    proxy_only: bool = False
 ) -> None:
     """
     Read inventory YAML, generate a per-host bash script, and run it via:
@@ -535,17 +536,7 @@ def omni_cli_start(
         export_block = _build_export_block(env)
         args_line = _build_args_line(args)
 
-        if not skip_process_nz_config:
-            start_server_cmd = f"""
-# Exec the command
-cd {_double_quotes(code_path)}/tools/scripts
-if [[ -e "/usr/local/Ascend/ascend-toolkit" ]]; then python /workspace/omniinfer/tools/scripts/process_nz_config.py /usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/config/ascend910_93/aic-ascend910_93-ops-info.json; else python /workspace/omniinfer/tools/scripts/process_nz_config.py /usr/local/Ascend/latest/opp/built-in/op_impl/ai_core/tbe/config/ascend910_93/aic-ascend910_93-ops-info.json; fi 
-echo "cd {_double_quotes(code_path)}/tools/scripts" >> {log_path}/omni_cli.log
-{python_bin} {entry_py} {args_line} >> {log_path}/omni_cli.log 2>&1 &
-echo "{python_bin} {entry_py} {args_line} >> {log_path}/omni_cli.log 2>&1 &" >> {log_path}/omni_cli.log
-"""
-        else:
-            start_server_cmd = f"""
+        start_server_cmd = f"""
 # Exec the command
 cd {_double_quotes(code_path)}/tools/scripts
 echo "cd {_double_quotes(code_path)}/tools/scripts" >> {log_path}/omni_cli.log
@@ -1044,36 +1035,6 @@ def _walk_hosts(node: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
         out.extend(_walk_hosts(child))
     return out
 
-def print_node_list(inventory_path: str) -> None:
-    """
-    Print the current node list including role, name, and IP address.
-
-    Args:
-        inventory_path: Path to the inventory YAML file
-    """
-    inv_file = Path(inventory_path).expanduser().resolve()
-    with open(inv_file, "r", encoding="utf-8") as f:
-        inv = yaml.safe_load(f)
-
-    children = inv.get("all", {}).get("children", {})
-
-    print(f"{'Role':<5} | {'Name':<5} | {'IP Address':<15} | {'ascend_rt_visible_devices':<30}")
-    print("-" * 60)
-
-    for role, role_data in children.items():
-        if role not in ["C", "D", "P"]:
-            continue
-
-        hosts = role_data.get("hosts", {})
-
-        for host_name, host_data in hosts.items():
-            ip_address = host_data.get("ansible_host", "N/A")
-            ascend_rt_visible_devices = host_data.get("ascend_rt_visible_devices", "N/A")
-
-            print(f"{role:<5} | {host_name:<5} | {ip_address:<15} | {ascend_rt_visible_devices:<30}")
-
-    print("-" * 60)
-
 def run_docker_containers(
     inventory_path,
     dry_run: bool = False,
@@ -1111,11 +1072,14 @@ def run_docker_containers(
         -v /usr/local/sbin:/usr/local/sbin \\
         -v /etc/hccn.conf:/etc/hccn.conf \\
         -v /usr/bin/hccn_tool:/usr/bin/hccn_tool \\
-        -v /tmp/ranktable_save_path:/tmp/ranktable_save_path \\
         -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime"""
 
+    thread_pool_executor = concurrent.futures.ThreadPoolExecutor()
+    futures = []
+    scripts = []
+
     for host, hv in all_hosts:
-        print(f"\nProcessing host: {host}")
+        print(f"Processing host: {host}")
 
         # Determine role
         groups = host_groups.get(host, [])
@@ -1133,6 +1097,10 @@ def run_docker_containers(
         model_path = env.get("MODEL_PATH")
         docker_image_id = hv.get("DOCKER_IMAGE_ID")
         container_name = hv.get("container_name", f"omni_container_{host}")
+        # In configs/generate_ranktable.yml, the ranktable save path defaults to "/tmp/ranktable_save_path" when not defined in the inventory
+        ranktable_save_path = env.get("RANKTABLE_SAVE_PATH", "/tmp/ranktable_save_path")
+        # Specify whatever path you want to mount in the docker container; separate with `;` when you want to mount multiple paths
+        user_mount_path = env.get("USER_MOUNT_PATH", "").split(';')
 
         # Check required variables
         if not log_path:
@@ -1174,9 +1142,19 @@ def run_docker_containers(
             # Add LOG_PATH mount with actual path
             tf.write(f"docker_cmd+=\" -v {shlex.quote(log_path)}:{shlex.quote(log_path)}\"\n")
 
+            tf.write(f"docker_cmd+=\" -v {shlex.quote(ranktable_save_path)}:{shlex.quote(ranktable_save_path)}\"\n")
+
             # Add MODEL_PATH
             if model_path:
                 tf.write(f"docker_cmd+=\" -v {shlex.quote(model_path)}:{shlex.quote(model_path)}\"\n")
+
+            for path in user_mount_path:
+                if path == '':
+                    # When user mount path is not defined in the inventory and assigned an empty string, 
+                    # the split method results in a list containing a single empty string
+                    break
+                tf.write(f"docker_cmd+=\" -v {shlex.quote(path)}:{shlex.quote(path)}\"\n")
+
 
             tf.write(f"docker_cmd+=\" -d --name {shlex.quote(container_name)} {shlex.quote(docker_image_id)}\"\n")
 
@@ -1200,6 +1178,98 @@ def run_docker_containers(
                 print("===")
 
         if not dry_run:
+            # Build ansible command
+            cmd = (
+                f"ansible {shlex.quote(host)} "
+                f"-i {shlex.quote(str(inv_file))} "
+                f"-m script "
+                f"-a {shlex.quote(str(script_path))}"
+            )
+
+            # Start executing script in a thread
+            print(f"Executing script on host {host}\n")
+            futures.append(thread_pool_executor.submit(execute_command, cmd))
+            scripts.append(script_path)
+        else:
+            # In dry-run mode, just show what command would be executed
+            print(f"DRY RUN: Would execute for host {host}:")
+            print(f"  ansible {host} -i {inv_file} -m script -a {script_path}")
+
+    for i, f in enumerate(futures):
+        try:
+            return_code = f.result()
+            if return_code != 0:
+                print(f"{ERROR} Deployment on {all_hosts[i][0]} failed with return code {return_code}")
+                raise Exception("Deployment failed")
+        except Exception as e:
+            print(e)
+        finally:
+            # Clean up temporary file
+            try:
+                scripts[i].unlink(missing_ok=True)
+            except Exception as e:
+                print(f"{WARNING} Failed to delete temp file: {e}")
+
+    print("\nAll hosts processed.")
+
+def stop_docker_containers(
+    inventory_path,
+    dry_run: bool = False,
+) -> None:
+    inv_file = Path(inventory_path).expanduser().resolve()
+
+    # Load inventory
+    with open(inv_file, "r", encoding="utf-8") as f:
+        inv = yaml.safe_load(f)
+
+    all_hosts = _walk_hosts(inv.get("all", inv))
+    host_groups = get_host_groups(inv)
+
+    if not all_hosts:
+        print(f"{WARNING} No hosts found in inventory.")
+        return
+
+    for host, hv in all_hosts:
+        print(f"\nProcessing host: {host}")
+
+        # Determine role
+        groups = host_groups.get(host, [])
+        role = "C"
+        if 'P' in groups:
+            role = "P"
+        elif 'D' in groups:
+            role = "D"
+        elif 'C' in groups:
+            role = "C"
+
+        container_name = hv.get("container_name", f"omni_container_{host}")
+
+        # Create temporary script file
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as tf:
+            script_path = Path(tf.name)
+
+            # Write script content
+            tf.write("#!/bin/bash\n")
+            tf.write("set -euo pipefail\n\n")
+
+            # Clean up existing container
+            tf.write("\n# Cleanup existing container\n")
+            tf.write(f"if docker inspect --format='{{{{.Name}}}}' {shlex.quote(container_name)} &>/dev/null; then\n")
+            tf.write(f"    docker stop {shlex.quote(container_name)}\n")
+            tf.write(f"    docker rm -f {shlex.quote(container_name)}\n")
+            tf.write("fi\n")
+
+            # Set execution permissions
+            os.chmod(script_path, 0o755)
+
+        # Print script content in dry-run mode
+        if dry_run:
+            print(f"=== DRY RUN: Script for host {host} ===")
+            with open(script_path, "r") as script_file:
+                print(script_file.read())
+            print("===")
+
+        if not dry_run:
             try:
                 # Build ansible command
                 cmd = (
@@ -1212,8 +1282,8 @@ def run_docker_containers(
                 print(f"Executing script on host {host}:")
                 return_code = execute_command(cmd)
                 if return_code != 0:
-                    print(f"{ERROR} Deployment failed with return code {return_code}")
-                    raise Exception("Deployment failed")
+                    print(f"{ERROR} Stop docker containers failed with return code {return_code}")
+                    raise Exception("Stop docker containers failed")
             finally:
                 # Clean up temporary file
                 try:
@@ -1231,9 +1301,126 @@ def upgrade_packages():
     """Install the latest wheel package"""
     print("Under development")
 
-def collect_logs():
+def collect_logs(inventory_path):
     """Fetch logs"""
-    print("Under development")
+    # Read inventory file
+    with open(inventory_path, 'r') as f:
+        inventory_data = yaml.safe_load(f)
+
+    local_log_path = "/logs"
+    try:
+        os.mkdir(local_log_path)
+        print(f"Directory '{local_log_path}' created successfully")
+    except FileExistsError:
+        print(f"Directory '{local_log_path}' already exists")
+    except OSError as e:
+        print(f"Error creating directory: {e}")
+
+    # Get host-group mapping
+    host_groups = get_host_groups(inventory_data)
+
+    # Get all hosts and their variables using _walk_hosts
+    all_hosts = dict(_walk_hosts(inventory_data.get("all", inventory_data)))
+
+    all_target_hosts = [host for host, _groups in host_groups.items()]
+
+    # Create temporary script file
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as tf:
+        script_path = tf.name
+
+        # Write script header
+        tf.write("#!/bin/bash\n\n")
+
+        # Add progress indicator function
+        tf.write("""
+# Function to show progress spinner
+show_spinner() {
+    local pid=$!
+    local delay=0.1
+    local spinstr='|/-\'
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spinstr#?}
+        printf " [%c] " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\\b\\b\\b\\b\\b"
+    done
+    printf "    \\b\\b\\b\\b"
+}
+""")
+
+        # Collect logs from all target hosts
+        for host in all_target_hosts:
+            host_vars = all_hosts.get(host, {})
+            # Get actual connection address for the host
+            host_addr = host_vars.get("ansible_host", host)
+
+            # Get SSH key path (if exists)
+            ssh_private_key = host_vars.get("ansible_ssh_private_key_file", "")
+            ssh_password = host_vars.get("ansible_ssh_pass","")
+            ssh_user = host_vars.get("ansible_user", "")
+
+            # Build SSH command prefixes
+            ssh_prefix = "ssh"
+            rsync_prefix = "rsync -avz --quiet --delete"
+
+            if ssh_private_key:
+                ssh_prefix = f"{ssh_prefix} -i {ssh_private_key}"
+
+            if ssh_user:
+                ssh_prefix = f"{ssh_prefix} -l {ssh_user}"
+            
+            rsync_prefix = f"rsync -avz --quiet --delete -e '{ssh_prefix}'"
+
+            if not ssh_private_key and ssh_password:
+                rsync_prefix = f"sshpass -p {ssh_password} rsync -avz --quiet --delete"
+
+            env = host_vars.get("env", {})
+            log_path = env.get("LOG_PATH")
+            log_sub_dir = host if host != "c0" else "nginx"
+            tf.write(f"echo \"{INFO} Collecting logs from {host} from \'{host}:{log_path}/{log_sub_dir}\' to \'{local_log_path}\' \"\n")
+            tf.write(f"echo -n \"{INFO} Progress: \"\n")
+            tf.write(f"{rsync_prefix} {ssh_user}@{host_addr}:{log_path}/{log_sub_dir} {local_log_path}/ & show_spinner\n")
+            tf.write(f"echo \"Done\"\n\n")
+
+
+    # Set script execution permissions
+    os.chmod(script_path, 0o755)
+
+    # Execute script 
+
+    print("Collecting logs...")
+    try:
+        # Execute the script and capture output
+        process = subprocess.Popen(
+            [script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        # Print output in real-time
+        for line in process.stdout:
+            print(line, end='')
+
+        # Wait for process to complete
+        process.wait()
+
+        if process.returncode == 0:
+            print("\nLogs collected successfully.")
+        else:
+            print(f"\nLog collection failed with return code {process.returncode}")
+            print("Error output:")
+            for line in process.stderr:
+                print(line, end='')
+    except Exception as e:
+        print(f"Error during log collection: {e}")
+    finally:
+        # Clean up temporary file
+        try:
+            os.unlink(script_path)
+        except:
+            pass
 
 def main():
     # Create main argument parser with description
@@ -1254,7 +1441,6 @@ def main():
     start_parser.add_argument("--skip-verify-config", action="store_true", help="Skip verification of config")
     start_parser.add_argument("--proxy-only", action="store_true", help="Start the proxy only")
     # for temporary avoidance
-    start_parser.add_argument("--skip-process-nz-config", action="store_true", help="Skip process-nz of config for temporary avoidance")
     start_group = start_parser.add_mutually_exclusive_group()
     start_group.add_argument(
         "--normal",
@@ -1265,7 +1451,19 @@ def main():
     start_group.add_argument("--run-dev", action="store_true", help="Start in developer mode: Start the service, without ranktable and proxy")
 
     # STOP command configuration
-    subparsers.add_parser("stop", help="Stop the omni service")
+    stop_parser=subparsers.add_parser("stop", help="Stop the omni service")
+    # 添加 --config_path 参数
+    stop_parser.add_argument(
+        "--config_path",
+        default=None,
+        help="Path to the configuration file"
+    )
+    stop_parser.add_argument(
+        "--normal",
+        nargs=1,
+        metavar='config_path',
+        help="Start in normal mode (default) with config file"
+    )
 
     # CFG command configuration
     cfg_parser = subparsers.add_parser("cfg", help="Modify configuration")
@@ -1274,7 +1472,18 @@ def main():
     cfg_parser.add_argument('name', nargs=1, help='Node name (e.g., prefill_0)')
     cfg_parser.add_argument('remaining_args', nargs=argparse.REMAINDER, help='Additional optional parameters')
     cfg_group.add_argument("--delete", action='store_true', help="Delete configuration keys (e.g., --key)")
-
+    # 添加 --config_path 参数
+    cfg_parser.add_argument(
+        "--config_path",
+        default=None,
+        help="Path to the configuration file"
+    )
+    cfg_parser.add_argument(
+        "--normal",
+        nargs=1,
+        metavar='config_path',
+        help="Start in normal mode (default) with config file"
+    )
     # INSPECT command configuration
     inspect_parser = subparsers.add_parser("inspect", help="Inspect Configuration")
     inspect_parser.add_argument('name', nargs=1, help='Node name (e.g., prefill_0)')
@@ -1344,6 +1553,23 @@ def main():
         inventory_path=str(default_deploy_path),
         dry_run=args.dry_run
     ))
+
+    stop_docker_parser = subparsers.add_parser("stop_docker", help="Stop and remove Docker containers based on inventory")
+    stop_docker_parser.add_argument(
+        "--config_path", "-i",
+        default=None,
+        help=f"Path to server_profiles.yml (default: {default_deploy_path})"
+    )
+    stop_docker_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Dry run mode - show what would be done without executing"
+    )
+    stop_docker_parser.set_defaults(func=lambda args: stop_docker_containers(
+        inventory_path=str(default_deploy_path),
+        dry_run=args.dry_run
+    ))
+
     # SYNC_CODE command configuration
     sync_parser = subparsers.add_parser("sync_code", help="Developer mode: Synchronize the code")
     sync_parser.add_argument(
@@ -1381,8 +1607,17 @@ def main():
         dry_run=args.dry_run
     ))
 
-    args = parser.parse_args()
+    collect_logs_parser = subparsers.add_parser("collect_logs", help="Collect logs from containers to the local")
+    collect_logs_parser.add_argument(
+        "--deploy_path",
+        default=str(default_deploy_path),
+        help=f"Path to server_profiles.yml (default: {default_deploy_path})"
+    )
+    collect_logs_parser.set_defaults(func=lambda args: collect_logs(
+        inventory_path=str(default_deploy_path)
+    ))
 
+    args = parser.parse_args()
     if hasattr(args, 'func'):
         if args.command == 'run':
             args.func(args)
@@ -1406,45 +1641,44 @@ def main():
 
     if args.command == "start" and not any([args.normal, args.run_dev]):
         args.normal = True
+    # set config_path for args.command
+    if args.config_path is None:
+        args.config_path = default_deploy_path
 
     if args.command == "start":
-        if args.config_path is None:
-            args.config_path = default_deploy_path
         if args.normal:
             print(f"{INFO} Starting omni service in Normal mode...")
             omni_cli_start(inventory_path=args.config_path,
                            skip_verify_config=args.skip_verify_config,
                            dev=False,
-                           proxy_only=args.proxy_only,
-                           skip_process_nz_config=args.skip_process_nz_config)
+                           proxy_only=args.proxy_only)
         elif args.run_dev:
             print(f"{INFO} Starting omni service in Developer mode...")
             omni_cli_start(inventory_path=args.config_path,
                            skip_verify_config=args.skip_verify_config,
                            dev=True,
-                           proxy_only=args.proxy_only,
-                           skip_process_nz_config=args.skip_process_nz_config)
+                           proxy_only=args.proxy_only)
     elif args.command == "stop":
         print(f"{INFO} Stopping omni service...")
-        omni_cli_stop(inventory_path=default_deploy_path)
+        omni_cli_stop(inventory_path=args.config_path)
     elif args.command == "cfg":
+        # 使用 args.config_path 作为配置文件路径
+        config_path = args.config_path if args.config_path is not None else default_deploy_path
         node_type, node_name = parse_node_name(args.name[0])
-        sections = parse_remaining_args(node_type, node_name, args.set, args.remaining_args, default_deploy_path)
+        sections = parse_remaining_args(node_type, node_name, args.set, args.remaining_args, args.config_path)
         if args.set:
             print(f"{INFO} Set configuration.")
-            cfg_set_process(node_type, node_name, args, sections, default_deploy_path)
+            cfg_set_process(node_type, node_name, args, sections, args.config_path)
         elif args.delete:
             print(f"{INFO} Delete configuration.")
-            cfg_delete_process(node_type, node_name, args, sections, default_deploy_path)
+            cfg_delete_process(node_type, node_name, args, sections, args.config_path)
     elif args.command == "inspect":
         print(f"{INFO} Inspect configuration.")
-        print_node_config(default_deploy_path, args.name[0])
+        print_node_config(args.config_path, args.name[0])
     elif args.command == "upgrade":
         print(f"{INFO} Upgrade packages")
         upgrade_packages()
-    elif args.command == "collect_log":
-        print(f"{INFO} Fetch logs")
-        collect_logs()
 
 if __name__ == "__main__":
     main()
+

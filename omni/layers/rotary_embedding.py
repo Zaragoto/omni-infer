@@ -24,7 +24,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rotary Positional Embeddings."""
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, List, Literal
 import math
 import torch_npu
 import torch
@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.platforms import current_platform
+from vllm.distributed import get_pp_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding as GPURotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding as GPUMRotaryEmbedding
@@ -45,6 +46,8 @@ from vllm.model_executor.layers.rotary_embedding import (_yarn_find_correction_d
                                             _yarn_get_mscale,
                                             _rotate_neox,
                                             _rotate_gptj)
+from omni.layers.utils import ConditionalTNGScope
+from omni.models.config_loader.loader import model_extra_config
 
 SCALE_FACTOR = 8
 LOW_FREQ_FACTOR = 1
@@ -686,21 +689,24 @@ class PanguProMoERotaryEmbedding(RotaryEmbeddingTorchNpu):
             cos_sin = self.cos_sin_cache.index_select(0, position_ids)
             cos, sin = cos_sin.chunk(2, dim=-1)
 
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size) # TND
-        # query_rot = query[..., :self.rotary_dim]
-        # query_pass = query[..., self.rotary_dim:]
-        query_rot, query_pass = query.split([self.rotary_dim, query.shape[-1] - self.rotary_dim], dim=-1)
-        query_rot = self.apply_rotary_emb_torch(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+        with ConditionalTNGScope(multi_stream=model_extra_config.operator_opt_config.moe_multi_stream_tune, stream_id='11'):
+            query_shape = query.shape
+            query = query.view(num_tokens, -1, self.head_size) # TND
+            # query_rot = query[..., :self.rotary_dim]
+            # query_pass = query[..., self.rotary_dim:]
+            query_rot, query_pass = query.split([self.rotary_dim, query.shape[-1] - self.rotary_dim], dim=-1)
+            query_rot = self.apply_rotary_emb_torch(query_rot, cos, sin, self.is_neox_style)
+            query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
         if key is not None:
-            key_shape = key.shape
-            key = key.view(num_tokens, -1, self.head_size)
-            # key_rot = key[..., :self.rotary_dim]
-            # key_pass = key[..., self.rotary_dim:]
-            key_rot, key_pass = key.split([self.rotary_dim, key.shape[-1] - self.rotary_dim], dim=-1)
-            key_rot = self.apply_rotary_emb_torch(key_rot, cos, sin, self.is_neox_style)
-            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+            with ConditionalTNGScope(multi_stream=model_extra_config.operator_opt_config.moe_multi_stream_tune, stream_id='22'):
+                key_shape = key.shape
+                key = key.view(num_tokens, -1, self.head_size)
+                # key_rot = key[..., :self.rotary_dim]
+                # key_pass = key[..., self.rotary_dim:]
+                key_rot, key_pass = key.split([self.rotary_dim, key.shape[-1] - self.rotary_dim], dim=-1)
+                key_rot = self.apply_rotary_emb_torch(key_rot, cos, sin, self.is_neox_style)
+                key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
 
@@ -717,6 +723,177 @@ class PanguProMoERotaryEmbedding(RotaryEmbeddingTorchNpu):
 
 _ROPE_DICT: Dict[Tuple, nn.Module] = {}
 
+# MRotaryEmbedding with interleaved
+class MRotaryEmbeddingInterleaved(GPUMRotaryEmbedding):
+    """Rotary Embedding with Multimodal Sections and Interleaved Support."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        mrope_section: Optional[List[int]] = None,
+        mrope_interleaved: bool = True,
+        rotary_mode: Literal["half", "interleaved"] = "half",
+        num_hidden_layers_cache: int = 1
+    ) -> None:
+        # Enlarge max_position_embeddings for video inputs
+        self.cache_max_position_num = max_position_embeddings
+        super().__init__(
+            head_size,
+            rotary_dim,
+            self.cache_max_position_num,
+            base,
+            is_neox_style,
+            dtype,
+        )
+
+        self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
+        self.rotary_mode = rotary_mode
+
+        if self.mrope_section is None:
+            raise ValueError("mrope_section cannot be None.")
+        if sum(self.mrope_section) != rotary_dim // 2:
+            raise ValueError("Sum of mrope_section must equal rotary_dim // 2.")
+        if not self.mrope_interleaved:
+            raise ValueError("mrope_interleaved must be True when mrope_section is provided.")
+
+        # Generate interleaved indices
+        if len(mrope_section) == 2:
+            h_num, w_num = mrope_section[0], mrope_section[1]
+            mrope_dim = self.get_mrope_interleaved_id_list(h_num, w_num, 0)
+        elif len(mrope_section) == 3:
+            t_num, h_num, w_num = mrope_section[0], mrope_section[1], mrope_section[2]
+            mrope_dim = self.get_mrope_interleaved_id_list(t_num, h_num, w_num, force_last=True)
+        else:
+            raise AssertionError("Cannot support the length of mrope section is not 2 or 3.")
+
+        mrope_dim = mrope_dim * 2
+        self.mrope_dim = mrope_dim
+
+        self.layer_cache = None
+        self.layer_counts = 0
+        self.num_hidden_layers_cache = num_hidden_layers_cache
+
+    def _rebuild_pos_emb(
+        self,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Interleave the rotary embedding"""
+        cos_sin = self.cos_sin_cache[positions]
+        mrope_section_3d = [1] * len(self.mrope_dim)
+        mrope_dim = self.mrope_dim
+        cos_sin = torch.cat(
+            [m[mrope_dim[i]] for i, m in enumerate(cos_sin.split(mrope_section_3d, dim=-1))],
+            dim=-1,
+        )
+        return cos_sin, torch.arange(cos_sin.shape[0], device=positions.device)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward pass with interleaved rotary embedding."""
+        if self.layer_counts % self.num_hidden_layers_cache == 0:
+            cos_sin, positions = self._rebuild_pos_emb(positions)
+            self.layer_cache = (cos_sin, positions)
+            self.layer_counts = 0
+        else:
+            cos_sin, positions = self.layer_cache
+        self.layer_counts += 1
+
+        import torch_npu
+
+        mrope_section = [0, 0, 0] if positions.ndim == 1 else self.mrope_section
+
+        num_tokens = query.shape[0]
+
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        if positions.ndim == 2:
+            assert self.mrope_section
+
+            cos = torch.cat(
+                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                dim=-1,
+            )
+            sin = torch.cat(
+                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                dim=-1,
+            )
+            
+
+        query_shape = query.shape
+        query = query.reshape(num_tokens, -1, self.head_size)
+        query_rot = query[..., :self.rotary_dim]
+        query_pass = query[..., self.rotary_dim:]
+        query_rot = _apply_rotary_emb_torch(query_rot, cos, sin, self.is_neox_style)
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.reshape(num_tokens, -1, self.head_size)
+        key_rot = key[..., :self.rotary_dim]
+        key_pass = key[..., self.rotary_dim:]
+        key_rot = _apply_rotary_emb_torch(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+
+
+        return query, key
+
+    @staticmethod
+    def get_mrope_interleaved_id_list(a: int, b: int, c: int, force_last: bool = False) -> List[int]:
+        """
+        Generate an interleaved list of indices for multi-modal rotary embedding.
+
+        Args:
+            a: Number of indices for first modality
+            b: Number of indices for second modality
+            c: Number of indices for third modality
+            force_last: Whether to force the last element to be from the first modality
+
+        Returns:
+            List of interleaved indices
+        """
+        if force_last:
+            a -= 1
+
+        counts = {0: a, 1: b, 2: c}
+        placed = {k: 0 for k in counts}
+        rem = counts.copy()
+        seq: List[int] = []
+        last = None
+
+        total = a + b + c
+        for _ in range(total):
+            # Candidates: remaining > 0 and ≠ last
+            cands = [k for k in rem if rem[k] > 0 and k != last]
+            if not cands:
+                # If only last remains, relax the condition
+                cands = [k for k in rem if rem[k] > 0]
+
+            # Select the rarest candidate
+            try:
+                best = min(cands, key=lambda k: (placed[k] / counts[k], k))
+            except KeyError:
+                best = 0
+
+            seq.append(best)
+            placed[best] += 1
+            rem[best] -= 1
+            last = best
+
+        if force_last:
+            seq.append(0)
+
+        return seq
+
+
 
 def get_rope(
         head_size: int,
@@ -728,6 +905,7 @@ def get_rope(
         dtype: Optional[torch.dtype] = None,
         partial_rotary_factor: float = 1.0,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+        num_hidden_layers_cache: int = 1
 ):
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -741,6 +919,9 @@ def get_rope(
         rope_scaling_args = tuple(rope_scaling_tuple.items())
     else:
         rope_scaling_args = None
+
+    if partial_rotary_factor < 1.0:
+        rotary_dim = int(rotary_dim * partial_rotary_factor)
 
     key = (head_size, rotary_dim, max_position, base, is_neox_style,
            rope_scaling_args)
@@ -802,6 +983,28 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"]
                 )
+            else:
+                rotary_emb = QwenRotaryEmbedding(
+                        head_size, 
+                        rotary_dim, 
+                        max_position, 
+                        base,
+                        is_neox_style)
+        elif scaling_type == "pangu":
+            if 'mrope_section' in rope_scaling:
+                num_hidden_layers_cache = 1 if get_pp_group().world_size > 1 else num_hidden_layers_cache
+                rotary_emb = MRotaryEmbeddingInterleaved(
+                        head_size,
+                        rotary_dim,
+                        max_position,
+                        base,
+                        is_neox_style,
+                        dtype,
+                        mrope_section=rope_scaling["mrope_section"],
+                        mrope_interleaved=True,
+                        rotary_mode=rope_scaling.get("rotary_mode", "half"),
+                        num_hidden_layers_cache=num_hidden_layers_cache
+                    )
             else:
                 rotary_emb = QwenRotaryEmbedding(
                         head_size, 

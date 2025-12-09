@@ -40,7 +40,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
 from vllm.platforms import current_platform
 from vllm.config import (get_current_vllm_config, CompilationLevel)
-from omni.layers.rotary_embedding import QwenMRotaryEmbedding
+from omni.layers.rotary_embedding import QwenMRotaryEmbedding, MRotaryEmbeddingInterleaved
 from omni.layers.attention.backend.attention_dummy_builder import DummyAttentionMetadataBuilder
 from omni.models.config_loader.loader import model_extra_config
 
@@ -404,7 +404,7 @@ class AscendAttentionMetadataBuilder(DummyAttentionMetadataBuilder):
 
         if hasattr(self.runner.model, 'language_model') and hasattr(self.runner.model.language_model, 'model'):
             first_layer_ind = self.runner.model.language_model.model.start_layer
-            Rotary_List = [QwenMRotaryEmbedding, DynamicNTKScalingRotaryEmbedding]
+            Rotary_List = [QwenMRotaryEmbedding, DynamicNTKScalingRotaryEmbedding, MRotaryEmbeddingInterleaved]
             if type(self.runner.model.language_model.model.layers[first_layer_ind].self_attn.rotary_emb) in Rotary_List:
                 cos, sin = None, None
             else:
@@ -468,7 +468,7 @@ class AscendAttentionMetadataBuilder(DummyAttentionMetadataBuilder):
 
         if hasattr(self.runner.model, 'language_model') and hasattr(self.runner.model.language_model, 'model'):
             first_layer_ind = self.runner.model.language_model.model.start_layer
-            Rotary_List = [QwenMRotaryEmbedding, DynamicNTKScalingRotaryEmbedding]
+            Rotary_List = [QwenMRotaryEmbedding, DynamicNTKScalingRotaryEmbedding, MRotaryEmbeddingInterleaved]
             if type(self.runner.model.language_model.model.layers[first_layer_ind].self_attn.rotary_emb) in Rotary_List:
                 cos, sin = None, None
             else:
@@ -816,17 +816,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if (self.enable_graph_mode and attn_metadata.attn_state == AscendAttentionState.DecodeOnly) or (self.is_hybrid_chunked_prefill_graph_mode and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill):
             attn_output = tng.ops.npu_fused_infer_attention_score_v2(
-                torch.transpose(query.view(num_batch, -1, self.num_heads, self.head_size), 1, 2),
+                query,
                 kv_cache[0].view(-1, self.num_kv_heads, self.head_size // NZ_DIM, block_size, NZ_DIM),
                 kv_cache[1].view(-1, self.num_kv_heads, self.head_size // NZ_DIM, block_size, NZ_DIM),
                 num_query_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
-                input_layout="BNSD",
+                input_layout="TND",
                 softmax_scale=self.scale,
                 block_table=attn_metadata.block_tables,
                 block_size=block_size,
                 sparse_mode=sparse_mode,
                 atten_mask=AscendAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+                actual_seq_qlen=attn_metadata.query_lens.cumsum(dim=0),
                 actual_seq_kvlen=attn_metadata.seq_lens,
                 inner_precise=1,
                 pre_tokens=pre_tokens,
@@ -899,14 +900,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # Scale-format constraints under GQA quantization with BNSD layout.
             k_scale = layer.k_scale.view(self.num_kv_heads, 1, -1) 
             v_scale = layer.v_scale.view(self.num_kv_heads, 1, -1)
-            # MTP=0
-            sparse_mode = 0
-            atten_mask = None
         else:
             k_scale = None 
             v_scale = None
-            sparse_mode = 3
-            atten_mask = AscendAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE
         use_omni_cache = model_extra_config.operator_opt_config.use_omni_cache
         omni_cache = getattr(attn_metadata, "omni_cache", None)
         block_size = kv_cache[0].shape[-2] if kv_cache[0].numel() > 0 else 128
@@ -989,8 +985,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 value_quant_mode=0,
                 block_table=attn_metadata.block_tables,
                 block_size=block_size,
-                sparse_mode=sparse_mode,
-                atten_mask=atten_mask,
                 actual_seq_kvlen=attn_metadata.seq_lens,
                 inner_precise=1
             )[0]
@@ -1346,6 +1340,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_metadata: AscendMetadata,
             output: Optional[torch.Tensor] = None,
             trace_flag: bool = True,
+            sink_pad_params: Optional[dict] = None,
             sink_query: Optional[torch.Tensor] = None,
             sink_key: Optional[torch.Tensor] = None,
             sink_value: Optional[torch.Tensor] = None,
@@ -1408,8 +1403,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_batch = attn_metadata.query_lens.shape[0]
         
         # Sink stored in block 0, so pad block_tables with 0 at the beginning
-        block_tables = F.pad(attn_metadata.block_tables, (1, 0, 0, 0), value=0)
-        actual_seq_lengths_kv = attn_metadata.seq_lens + 128
+        if sink_pad_params is None:
+            block_tables = F.pad(attn_metadata.block_tables, (1, 0, 0, 0), value=0)
+            actual_seq_lengths_kv = attn_metadata.seq_lens + 128
+        else:
+            block_tables = sink_pad_params['sink_block_tables']
+            actual_seq_lengths_kv = sink_pad_params['sink_actual_seq_lengths_kv']
 
         if self.enable_graph_mode and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
             attn_output = tng.ops.npu_fused_infer_attention_score_v2(

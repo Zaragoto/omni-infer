@@ -12,8 +12,10 @@ NGINX_SBIN_PATH="${NGINX_SBIN_PATH:-/usr/sbin}"
 echo "NGINX_SBIN_PATH is $NGINX_SBIN_PATH"
 
 if [ ! -d nginx-${NGINX_VERSION} ]; then
-	wget --no-check-certificate https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
-	tar -zxf nginx-${NGINX_VERSION}.tar.gz
+    if [ ! -f "nginx-${NGINX_VERSION}.tar.gz" ]; then
+	    wget --no-check-certificate https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+	fi
+    tar -zxf nginx-${NGINX_VERSION}.tar.gz
 fi
 
 # yum install -y pcre gcc gcc-c++ make zlib zlib-devel pcre pcre-devel openssl-devel

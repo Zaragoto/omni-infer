@@ -36,7 +36,7 @@ all:
             extra-args:
               disable-log-requests: ''
               enable-expert-parallel: ''
-              max-num-seqs: 64
+              max-num-seqs: 32
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
             gpu-util: '0.92'
@@ -88,7 +88,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ${SERVER_IP_LIST}
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_DECODE: 8192
+            MODEL_LEN_MAX_DECODE: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1
@@ -128,7 +128,7 @@ all:
             extra-args:
               disable-log-requests: ''
               enable-expert-parallel: ''
-              max-num-seqs: 64
+              max-num-seqs: 32
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
             gpu-util: '0.92'
@@ -180,7 +180,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ${SERVER_IP_LIST}
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_DECODE: 8192
+            MODEL_LEN_MAX_DECODE: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1
@@ -220,7 +220,7 @@ all:
             extra-args:
               disable-log-requests: ''
               enable-expert-parallel: ''
-              max-num-seqs: 64
+              max-num-seqs: 32
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
             gpu-util: '0.92'
@@ -272,7 +272,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ${SERVER_IP_LIST}
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_DECODE: 8192
+            MODEL_LEN_MAX_DECODE: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1
@@ -312,7 +312,7 @@ all:
             extra-args:
               disable-log-requests: ''
               enable-expert-parallel: ''
-              max-num-seqs: 64
+              max-num-seqs: 32
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
             gpu-util: '0.92'
@@ -364,7 +364,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ${SERVER_IP_LIST}
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_DECODE: 8192
+            MODEL_LEN_MAX_DECODE: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1
@@ -403,7 +403,7 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 8192
+              max-num-batched-tokens: 32768
               max-num-seqs: 64
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
@@ -456,7 +456,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ''
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_PREFILL: 8192
+            MODEL_LEN_MAX_PREFILL: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1
@@ -494,7 +494,7 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 8192
+              max-num-batched-tokens: 32768
               max-num-seqs: 64
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
@@ -547,7 +547,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ''
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_PREFILL: 8192
+            MODEL_LEN_MAX_PREFILL: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1
@@ -585,7 +585,7 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 8192
+              max-num-batched-tokens: 32768
               max-num-seqs: 64
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
@@ -638,7 +638,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ''
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_PREFILL: 8192
+            MODEL_LEN_MAX_PREFILL: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1
@@ -676,7 +676,7 @@ all:
               disable-log-requests: ''
               enable-expert-parallel: ''
               enforce-eager: ''
-              max-num-batched-tokens: 8192
+              max-num-batched-tokens: 32768
               max-num-seqs: 64
               no-enable-prefix-caching: ''
               no-enable-chunked-prefill: ''
@@ -729,7 +729,7 @@ all:
             LOCAL_DECODE_SERVER_IP_LIST: ''
             LOG_PATH: /tmp/log_path
             MASTER_PORT: 8000
-            MODEL_LEN_MAX_PREFILL: 8192
+            MODEL_LEN_MAX_PREFILL: 32768
             MODEL_PATH: /data/models/Ling-1T
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 1

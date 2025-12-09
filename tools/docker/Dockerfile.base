@@ -1,6 +1,6 @@
 # The Dockerfile is used to construct base image.
 
-ARG BASE_IMAGE=openeuler/openeuler:22.03-lts-sp4
+ARG BASE_IMAGE
 #################### PYTHON BUILD IMAGE ####################
 FROM ${BASE_IMAGE} AS tmp_base
 ARG ARCHITECTURE
@@ -67,6 +67,7 @@ FROM base AS cann_pytorch
 ARG HTTP_PROXY
 ARG PIP_INDEX_URL
 ARG PIP_TRUSTED_HOST
+ARG CANN_INSTALL_MODE
 ARG ARCHITECTURE
 
 RUN mkdir -p /workspace/copy_data && \
@@ -75,7 +76,7 @@ RUN mkdir -p /workspace/copy_data && \
 # Copy Ascend files
 COPY --from=driver /driver /usr/local/Ascend/driver
 COPY --from=etc /ascend_install.info /etc/ascend_install.info
-COPY ./copy_data/A*-cann*run ./copy_data/*whl /workspace/copy_data/
+COPY copy_data /workspace/copy_data/
 
 # Install PyTorch according to architecture
 RUN cd /workspace/copy_data && \
@@ -97,13 +98,52 @@ RUN cd /workspace/copy_data && \
         exit 1; \
     fi && \
     pip cache purge && \
-    yum -y install util-linux diffutils && \
+    yum -y install sudo util-linux diffutils hostname net-tools && \
     yum clean all && \
     rm -rf /var/cache/yum
 
-# Install CANN packages
+
+    # Install CANN packages
 RUN cd /workspace/copy_data && \
     chmod +x *.run && \
+    if [ "$CANN_INSTALL_MODE" = "split" ]; then \
+    FWKPLUGIN=$(find ./ -name "tfadapter*" -type f) && \
+    if [ -f "$FWKPLUGIN" ]; then \
+    tar -zxvf /workspace/copy_data/tfadapter*; \
+    pip install fwkplugin/bin/npu_*; \
+    fi; \
+    if [ -f ./CANN-runtime-*.run ]; then \
+    echo y | ./CANN-runtime-*.run --full; \
+    fi; \
+    if [ -f ./CANN-opp-*.run ]; then \
+    echo y | ./CANN-opp-*.run --full; \
+    fi; \
+    if [ -f ./CANN-toolkit-*.run ]; then \
+    echo y | ./CANN-toolkit-*.run --full --pylocal; \
+    fi; \
+    if [ -f ./CANN-compiler-*.run ]; then \
+    echo y | ./CANN-compiler-*.run --full --pylocal; \
+    fi; \
+    if [ -f ./CANN-hccl-*.run ]; then \
+    echo y | ./CANN-hccl-*.run --full --pylocal; \
+    fi; \
+    if [ -f ./CANN-aoe-*.run ]; then \
+    echo y | ./CANN-aoe-*.run --full; \
+    fi; \
+    if [ -f ./Ascend*-opp_kernel-*.run ]; then \
+    echo y | ./Ascend*-opp_kernel-*.run --full; \
+    fi && \
+    echo "export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/latest" >> ~/.bashrc && \
+    echo "source /usr/local/Ascend/latest/bin/setenv.bash" >> ~/.bashrc && \
+    source ~/.bashrc && \
+    if [ -f ./Ascend-cann-nnal*.run ]; then \
+    echo Y | ./Ascend-cann-nnal*.run --install && \
+    echo "source /usr/local/Ascend/nnal/atb/set_env.sh" >> ~/.bashrc; \
+    fi && \
+    echo 'export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:$LD_LIBRARY_PATH' >> ~/.bashrc && \
+    echo 'export HCCL_OP_RETRY_ENABLE="L0:0, L1:0, L2:0"' >> ~/.bashrc && \
+    source ~/.bashrc; \
+    else \
     TOOLKITFILE=$(find ./ -name "Ascend-cann-toolkit_*.run" -type f) && \
     echo y | ./$TOOLKITFILE --install && \
     echo 'source /usr/local/Ascend/ascend-toolkit/set_env.sh' >> ~/.bashrc && \
@@ -124,7 +164,9 @@ RUN cd /workspace/copy_data && \
         DRIVER_LIB_PATH="/usr/local/Ascend/driver/lib64/driver" && \
         TOOLKIT_RUNTIME_LIB_PATH="/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64/stub" && \
         echo "export LD_LIBRARY_PATH=$DRIVER_LIB_PATH:\$LD_LIBRARY_PATH:$TOOLKIT_RUNTIME_LIB_PATH/" >> ~/.bashrc; \
+    fi \
     fi && \
+    if [ -n "$EXECUTE_CMD" ]; then sh -c "$EXECUTE_CMD"; fi && \
     sed -i '/TMOUT=/d' /etc/bashrc && \
     rm -rf /workspace/copy_data
 #################### CANN Pytorch IMAGE ####################

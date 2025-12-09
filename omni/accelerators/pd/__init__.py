@@ -11,12 +11,16 @@ def register():
     KVConnectorFactory.register_connector(
         "AscendHcclConnectorV1",
         (
-            "omni.accelerators.pd.omni_cache_connector_v2"
-            if os.getenv("ENABLE_D_SIDE_FIRST", "0") == "1"
+            "omni.accelerators.pd.omni_cache_connector_d2p"
+            if os.getenv("ENABLE_D_SIDE_FIRST", "0") == "1" and os.getenv("ENABLE_OMNI_CACHE", "0") == "1"
             else (
-                "omni.accelerators.pd.omni_cache_connector_v1"
-                if os.getenv("ENABLE_OMNI_CACHE", "0") == "1"
-                else "omni.accelerators.pd.llmdatadist_connector_v1"
+                "omni.accelerators.pd.llmdatadist_connector_d2p"
+                if os.getenv("ENABLE_D_SIDE_FIRST", "0") == "1"
+                else (
+                    "omni.accelerators.pd.omni_cache_connector_v1"
+                    if os.getenv("ENABLE_OMNI_CACHE", "0") == "1"
+                    else "omni.accelerators.pd.llmdatadist_connector_v1"
+                )
             )
         ),
         "LLMDataDistConnector"

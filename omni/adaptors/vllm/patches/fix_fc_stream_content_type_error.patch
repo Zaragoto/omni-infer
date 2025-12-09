@@ -1,0 +1,15 @@
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 993c427..2358bdd 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -1549,6 +1549,8 @@ class OpenAIServingChat(OpenAIServing):
+             # get the expected call based on partial JSON
+             # parsing which "autocompletes" the JSON
+             expected_call = tool_parser.prev_tool_call_arr[index].get("arguments", '{}')
++            if isinstance(expected_call, dict):
++                expected_call = json.dumps(expected_call, ensure_ascii=False)
+ 
+             # get what we've streamed so far for arguments
+             # for the current tool
+-- 
+

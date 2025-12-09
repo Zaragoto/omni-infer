@@ -2,6 +2,7 @@
     "model_parallel_config": {
         "dense_mlp_tp_size": 1,
         "o_proj_tp_size": 1,
+        "eh_proj_tp_size": 4,
         "redundancy_shared_expert_num": 32
     },
     "operator_optimization_config": {
@@ -25,6 +26,8 @@
         "expert_down_prefetch": 40,
         "shared_expert_gate_up_prefetch": 80,
         "shared_expert_down_prefetch": 40,
-        "attn_prefetch": 40
+        "attn_prefetch": 40,
+        "dense_mlp_prefetch": 10,
+        "lm_head_prefetch": 145
     }
 }

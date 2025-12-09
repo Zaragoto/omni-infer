@@ -397,13 +397,18 @@ fi
 export ENABLE_APC_EVENT=0
 
 # path to local dir of profile, comment to disable profile api
-export VLLM_TORCH_PROFILER_DIR=/tmp/profiling
+# export VLLM_TORCH_PROFILER_DIR=/tmp/profiling
 
 # enable middleware
 if [[ -n "$VALIDATORS_CONFIG_PATH" ]]; then
     EXTRA_ARGS="$EXTRA_ARGS --middleware omni.adaptors.vllm.entrypoints.middleware.param_check.ValidateSamplingParams"
 else
     EXTRA_ARGS="$EXTRA_ARGS"
+fi
+
+if [[ -z "$VLLM_LOGGING_CONFIG_PATH" ]]; then
+    SCRIPT_DIR=$(dirname "$(realpath "$0")")
+    export VLLM_LOGGING_CONFIG_PATH=$SCRIPT_DIR"/logging_config_default.json"
 fi
 
 # Print current configuration
@@ -455,6 +460,7 @@ echo "RAY_PORT: $RAY_PORT"
 echo "RAY_MIN_WORKER_PORT: $RAY_MIN_WORKER_PORT"
 echo "RAY_MAX_WORKER_PORT: $RAY_MAX_WORKER_PORT"
 echo "PRINT_SCREEN: $PRINT_SCREEN"
+echo "VLLM_LOGGING_CONFIG_PATH: $VLLM_LOGGING_CONFIG_PATH"
 echo "=================="
 
 # Execute Python script
@@ -509,7 +515,12 @@ setup_multi_server_ray_backend_logging_config() {
     [ -z "$VLLM_LOGGING_CONFIG_PATH" ] || [ ! -f "$VLLM_LOGGING_CONFIG_PATH" ] && return
     local temp_file=$(mktemp)
     cp "$VLLM_LOGGING_CONFIG_PATH" "$temp_file"
-    sed -i 's|"filename": *"[^"]*"|"filename": "'"$LOG_DIR"'/server_0.log"|g' "$temp_file"
+    if grep -q '"omni_logging_format":true' "$VLLM_LOGGING_CONFIG_PATH"; then
+        sed -i 's|"filename": *"[^"]*"|"filename": "'"$LOG_DIR"'/server_0.log"|g' "$temp_file"
+    fi
+    if grep -q '"process_logging_config": true' "$VLLM_LOGGING_CONFIG_PATH"; then
+        python process_logging_config.py "$temp_file" --inplace
+    fi
     export VLLM_LOGGING_CONFIG_PATH="$temp_file"
 }
 

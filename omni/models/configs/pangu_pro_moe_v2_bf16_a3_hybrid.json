@@ -1,0 +1,15 @@
+{
+    "model_parallel_config": {
+        "dense_mlp_tp_size": 1
+    },
+    "operator_optimization_config": {
+        "prefill_moe_all_to_all": true,
+        "moe_multi_stream_tune": true,
+        "decode_moe_dispatch_combine": true,
+        "gmm_nz": true,
+        "use_tnd_pa": true,
+        "cast_w2_scale_f32": true,
+        "use_super_kernel": true,
+        "use_prefetch": true
+    }
+}

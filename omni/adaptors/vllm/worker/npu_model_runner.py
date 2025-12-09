@@ -32,7 +32,7 @@ from vllm.config import CompilationLevel, VllmConfig, get_layers_from_vllm_confi
 from vllm.attention.layer import Attention
 from vllm.attention import AttentionType
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_world_size, get_dp_group, get_tensor_model_parallel_rank
-from vllm.logger import logger
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (DeviceMemoryProfiler, is_pin_memory_available,
@@ -58,24 +58,24 @@ from omni.adaptors.vllm.platform import NPUPlatform
 from omni.adaptors.vllm.spec_decode.post_drafter import PostDrafter
 from omni.adaptors.vllm.worker.cache_engine import CacheEngine
 from omni.adaptors.vllm.utils import get_attr_by_names
-if os.environ.get("ENABLE_OMNI_CACHE", "0") == "1":
-    FLAG_OMNI_CACHE = True
-    if os.environ.get("ENABLE_D_SIDE_FIRST", "0") == "1":
-        from omni.accelerators.pd.omni_cache_connector_v2 import decode_h2d_trigger
-    else:
-        from omni.accelerators.pd.omni_cache_connector_v1 import decode_h2d_trigger
-else:
-    FLAG_OMNI_CACHE = False
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
+    
+logger = init_logger("vllm.npu_model_runner")
 
 _GLOBAL_STEP = 0
 MAX_GEAR_NUM = 6
 NPU_GENERATOR_OFFSET_STEP = 12 # ascend npu, move 12 every one generation, which is 4 on cuda.
+
+PRE_NUM_REQS = 0
+PRE_NUM_INPUT_TOKENS = 0
+COUNTER = 0
+PRE_COST = 0
+COST_THRESHOLD: float = float(os.environ.get("NPU_MODEL_RUNNER_COST_THRESHOLD", "0"))
 
 def _get_pad_size(num_seqs):
     tp_size = get_tensor_model_parallel_world_size()
@@ -135,30 +135,30 @@ class NPUModelRunner(GPUModelRunner):
         if vllm_config.additional_config is not None:
             self.use_rejection_sampler = vllm_config.additional_config.get("use_rejection_sampler", False)
             self.use_penalty = vllm_config.additional_config.get("use_penalty", False)
-            self.topk = vllm_config.additional_config.get("rejection_sampler_topk", -1)
             self.total_step = vllm_config.additional_config.get("multi_step", 1)
+            self.combine_block = vllm_config.additional_config.get("combine_block", 1)
             self.use_process_before_sample = vllm_config.additional_config.get("use_process_before_sample", False)
         else:
             self.use_rejection_sampler = False
             self.use_penalty = False
-            self.topk = -1
             self.total_step = 1
+            self.combine_block = 1
             self.use_process_before_sample = False
         self.curr_step = 0
         num_tokens_per_reqs_decode = 1 if not self.use_spec_decode else (1 + self.speculative_config.num_speculative_tokens)
         self.num_tokens_per_reqs_decode = num_tokens_per_reqs_decode
         self.decode_max_num_tokens = self.max_num_reqs * self.num_tokens_per_reqs_decode
         if get_pp_group().is_last_rank:
+            from omni.adaptors.vllm.sample.sampler import AscendSamplerV1 as NewAscendSamplerV1
+            self.sampler = NewAscendSamplerV1(self)
             if self.use_spec_decode:
-                from omni.adaptors.vllm.sample.sampler import AscendSamplerV1 as NewAscendSamplerV1
                 from omni.adaptors.vllm.sample.validator import SimpleValidator, SparseRejectionSamplerValidator
-                
-                self.sampler = NewAscendSamplerV1(self)
-                self.rejection_sampler = SimpleValidator(self) if not self.use_rejection_sampler else SparseRejectionSamplerValidator(self.sampler, self.topk, self.decode_max_num_tokens)
+                if not self.use_rejection_sampler:
+                    self.rejection_sampler = SimpleValidator(vllm_config, device, self)
+                else:
+                    self.rejection_sampler = SparseRejectionSamplerValidator(vllm_config, device, self)
                 self.drafter = PostDrafter(vllm_config, device, self)
-            else:
-                from omni.adaptors.vllm.sample.sampler import AscendSamplerV1 as NewAscendSamplerV1
-                self.sampler = NewAscendSamplerV1(self)
+
 
         self._init_graph_options()
 
@@ -186,9 +186,11 @@ class NPUModelRunner(GPUModelRunner):
         self.chunk_next_tokens = torch.zeros(
             self.max_num_reqs * num_tokens_per_reqs_decode, dtype= torch.int64, device=self.device
         )
+        self.max_num_blocks_per_req = cdiv(self.model_config.max_model_len,
+                                           self.block_size*self.combine_block)*self.combine_block
         self.graph_block_tables = np.zeros(
             (self.max_num_reqs * num_tokens_per_reqs_decode,
-             (self.model_config.max_model_len + self.block_size - 1) // self.block_size),
+             self.max_num_blocks_per_req),
             dtype=np.int32)
 
         self.cu_num_draft_tokens = torch.zeros(
@@ -219,8 +221,6 @@ class NPUModelRunner(GPUModelRunner):
 
         self.attn_mask = None
         self.attn_state = None
-        self.max_num_blocks_per_req = cdiv(self.model_config.max_model_len,
-                                           self.block_size)
 
         self.model_mark_static = False
         self.dummy_model_mark_static = False
@@ -412,7 +412,19 @@ class NPUModelRunner(GPUModelRunner):
         if num_reqs <= 0:
             raise RuntimeError("num_reqs must be greater than 0")
         num_input_tokens = total_num_scheduled_tokens
-        logger.warning(f"current num reqs = {num_reqs}, num_input_tokens = {num_input_tokens}")
+        tp_rank = get_tensor_model_parallel_rank()
+        if tp_rank == 0:
+            if COST_THRESHOLD == 0:
+                logger.info(f"current num reqs = {num_reqs}, num_input_tokens = {num_input_tokens}")
+            else:
+                global PRE_NUM_REQS, PRE_NUM_INPUT_TOKENS, COUNTER
+                if num_reqs != PRE_NUM_REQS or num_input_tokens != PRE_NUM_INPUT_TOKENS:
+                    logger.info(f"current num reqs = {num_reqs}, num_input_tokens = {num_input_tokens}, last_counter = {COUNTER}")
+                    PRE_NUM_REQS = num_reqs
+                    PRE_NUM_INPUT_TOKENS = num_input_tokens
+                    COUNTER = 0
+                else:
+                    COUNTER += 1
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -486,7 +498,7 @@ class NPUModelRunner(GPUModelRunner):
         graph_pad_size = 0
         if self.enable_torchair_graph_mode and len(self.decode_gear_list) > 1:
             if attn_state == AscendAttentionState.DecodeOnly:
-                self.max_batch_size = self._get_max_token_num(self.vllm_config.parallel_config.data_parallel_size > 1, num_reqs)
+                self.max_batch_size = self._get_max_token_num(self.vllm_config.parallel_config.data_parallel_size > 1, total_num_scheduled_tokens)
             elif self.is_hybrid_chunked_prefill_graph_mode and attn_state ==  AscendAttentionState.ChunkedPrefill:
                 self.max_batch_size = self._get_closest_gear(num_input_tokens)
 
@@ -801,7 +813,11 @@ class NPUModelRunner(GPUModelRunner):
                     attn_metadata_i.seq_lens_list = attn_metadata_i.seq_lens.tolist()
                 else:
                     attn_metadata_i.seq_lens_list = []
-                cos, sin = self.model.model.layers[0].self_attn.rotary_emb.get_cos_sin(positions)
+
+                if getattr(self, 'drafter', None) is not None and first_layer_in_group in self.drafter.attn_layer_names:
+                    cos, sin = next(self.drafter.model.model.layers.children()).self_attn.rotary_emb.get_cos_sin(positions)
+                else:
+                    cos, sin = self.model.model.layers[0].self_attn.rotary_emb.get_cos_sin(positions)
                 attn_metadata_i.cos = cos
                 attn_metadata_i.sin = sin
             if kv_cache_group_id == 0:
@@ -891,8 +907,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.planner.place_experts()
                 _GLOBAL_STEP = _GLOBAL_STEP + 1 if not is_prompt else 0
 
-            if FLAG_OMNI_CACHE:
-                decode_h2d_trigger()
             if self.enable_torchair_graph_mode and attn_state == AscendAttentionState.DecodeOnly or \
                 (self.is_hybrid_chunked_prefill_graph_mode and attn_state == AscendAttentionState.ChunkedPrefill):
                 start_debug = time.time()
@@ -916,9 +930,9 @@ class NPUModelRunner(GPUModelRunner):
                 cost_model = end_model - start_time
                 cost_os_env = start_time - start_os_env
                 cost_debug = start_debug - start_os_env
-                logger.info(f" ***** model forward: {cost_model:.6f}, os env: {cost_os_env:.6f}, debug: {cost_debug:.6f}")
+                logger.debug(f" ***** model forward: {cost_model:.6f}, os env: {cost_os_env:.6f}, debug: {cost_debug:.6f}")
             else:
-                logger.info("Start running eager model.")
+                logger.debug("Start running eager model.")
                 forward_results = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -1237,10 +1251,13 @@ class NPUModelRunner(GPUModelRunner):
 
         cost_output = time.time() - start_9
         cost = cost_upd_states + cost_proc_reqs + cost_logits + cost_bitmask + cost_sampler + cost_disc + cost_drafter + cost_device_output + cost_output
-        logger.info(f" ***** execute model cost:{cost:.6f}="
-                    f"{cost_upd_states:.6f}+{cost_proc_reqs:.6f}+{cost_logits:.6f}+{cost_bitmask:.6f}"
-                    f"+{cost_disc:.6f}+{cost_sampler:.6f}+{cost_drafter:.6f}+{cost_device_output:.6f}+{cost_output:.6f}")
-
+        
+        global PRE_COST, COST_THRESHOLD
+        if abs(cost - PRE_COST) >= COST_THRESHOLD:
+            logger.info(f" ***** execute model cost:{cost:.6f}="
+                        f"{cost_upd_states:.6f}+{cost_proc_reqs:.6f}+{cost_logits:.6f}+{cost_bitmask:.6f}"
+                        f"+{cost_disc:.6f}+{cost_sampler:.6f}+{cost_drafter:.6f}+{cost_device_output:.6f}+{cost_output:.6f}")
+        PRE_COST = cost
         finished_sending = self.finished_sending
         finished_recving = self.finished_recving
         loading_kv_failure = self.loading_kv_failure
@@ -1302,9 +1319,6 @@ class NPUModelRunner(GPUModelRunner):
 
         positions = self.mrope_positions[:, :num_tokens] if self.uses_mrope else self.positions[:num_tokens]
         raw_hidden_states = None
-
-        if FLAG_OMNI_CACHE:
-            decode_h2d_trigger()
 
         # No kv_caches: profile run
         if not self.kv_caches:
@@ -1384,15 +1398,12 @@ class NPUModelRunner(GPUModelRunner):
             use_compile = self.enable_torchair_graph_mode
             for _ in range(self.total_step):
                 if use_compile:
-                    logger.debug("Start running dummy compiled model.")
                     if not self.dummy_model_mark_static:
                         if isinstance(self.model, GraphCompileConfiguration):
                             self.model.mark_static_for_graph(input_ids, positions, attn_metadata, self.kv_caches)
                         else:
                             mark_static_for_graph_default(input_ids, inputs_embeds, positions, self.kv_caches)
                         self.dummy_model_mark_static = True
-                else:
-                    logger.debug("Start running dummy eager model.")
                 forward_results = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -1480,7 +1491,7 @@ class NPUModelRunner(GPUModelRunner):
         self.kv_cache_config = kv_cache_config
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
-            max_model_len=self.model_config.max_model_len,
+            max_model_len=self.max_num_blocks_per_req*self.block_size,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
             pin_memory=is_pin_memory_available(),
@@ -1564,7 +1575,7 @@ class NPUModelRunner(GPUModelRunner):
         self.kv_cache_config = kv_cache_config
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
-            max_model_len=self.model_config.max_model_len,
+            max_model_len=self.max_num_blocks_per_req*self.block_size,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
             pin_memory=is_pin_memory_available(),

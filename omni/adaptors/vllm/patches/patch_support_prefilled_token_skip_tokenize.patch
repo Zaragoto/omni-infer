@@ -1,5 +1,5 @@
 diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
-index bc11686d7..699238c63 100644
+index bc11686d7..9d6906adf 100644
 --- a/vllm/entrypoints/openai/serving_chat.py
 +++ b/vllm/entrypoints/openai/serving_chat.py
 @@ -45,6 +45,9 @@ from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
@@ -22,7 +22,7 @@ index bc11686d7..699238c63 100644
 +                        delta_text = tokenizer.convert_tokens_to_string([new_tokens])
 +                        # If the decoded text ends with '�', it indicates an incomplete UTF-8 sequence — abandon reuse.
 +                        # If the prefilled side has already triggered a stop reason, we also fall back to normal generation.
-+                        if delta_text.endswith("�") or any(s is not None for s in request.kv_transfer_params["stop_reasons"]):
++                        if delta_text.endswith("�") or any(s is not None for s in request.kv_transfer_params["stop_reasons"]) or request.kv_transfer_params["prefilled_token"][0] == tokenizer.eos_token_id:
 +                            request.kv_transfer_params.pop("prefilled_token", None)
 +                        else:
 +                            engine_prompt["prefilled_token_ids"] = request.kv_transfer_params["prefilled_token"]
@@ -66,7 +66,7 @@ index bc11686d7..699238c63 100644
                            completion_tokens=num_generated_tokens,
                            total_tokens=num_prompt_tokens +
 diff --git a/vllm/entrypoints/openai/serving_engine.py b/vllm/entrypoints/openai/serving_engine.py
-index e604ca33c..9832f5803 100644
+index e604ca33c..d4e840ccc 100644
 --- a/vllm/entrypoints/openai/serving_engine.py
 +++ b/vllm/entrypoints/openai/serving_engine.py
 @@ -81,6 +81,8 @@ from multiprocessing import Manager
@@ -78,7 +78,7 @@ index e604ca33c..9832f5803 100644
  CompletionLikeRequest = Union[CompletionRequest, DetokenizeRequest,
                                EmbeddingCompletionRequest, RerankRequest,
                                ClassificationRequest, ScoreRequest,
-@@ -1114,33 +1116,37 @@ class OpenAIServing:
+@@ -1114,33 +1116,39 @@ class OpenAIServing:
              request = tool_parser(tokenizer).adjust_request(  # type: ignore
                  request=request)
  
@@ -102,6 +102,8 @@ index e604ca33c..9832f5803 100644
 +        if request.kv_transfer_params and "prompt_token_ids" in request.kv_transfer_params:
 +            engine_prompt = TextTokensPrompt(
 +                prompt_token_ids=request.kv_transfer_params["prompt_token_ids"])
++            if isinstance(request_prompt, str):
++                self._validate_input(request, request.kv_transfer_params["prompt_token_ids"], request_prompt)
          else:
 -            # For MistralTokenizer
 -            assert is_list_of(request_prompt, int), (
@@ -171,7 +173,7 @@ index 843c45bd6..f1e55df86 100644
  class EmbedsPrompt(TypedDict):
      """Schema for a prompt provided via token embeddings."""
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index dbb6a62c4..ebec8fcce 100644
+index c0d68bef4..88a460c53 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -33,6 +33,8 @@ from vllm.v1.structured_output import StructuredOutputManager
@@ -183,7 +185,7 @@ index dbb6a62c4..ebec8fcce 100644
  
  class Scheduler(SchedulerInterface):
  
-@@ -1019,6 +1021,12 @@ class Scheduler(SchedulerInterface):
+@@ -1002,6 +1004,12 @@ class Scheduler(SchedulerInterface):
          num_computed_tokens = len(block_ids) * self.block_size
          if num_computed_tokens == request.num_tokens:
              num_computed_tokens -= 1

@@ -323,6 +323,11 @@ def patch_pangu():
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "deepseek_mtp", "ernie_mtp","pangu_ultra_moe_mtp","qwen3_mtp","pangu_moe_v2_mtp")
 
+    def patch_chat_utils():
+        from vllm.entrypoints.chat_utils import BaseMultiModalItemTracker
+        from omni.adaptors.vllm.entrypoints.chat_utils import _placeholder_str_add_pangu
+        BaseMultiModalItemTracker._placeholder_str = _placeholder_str_add_pangu
+
     ModelConfig.is_deepseek_mla = is_deepseek_mla
     ModelConfig._verify_with_expert_parallelism = _verify_with_expert_parallelism
     ModelConfig.get_head_size = get_head_size
@@ -330,6 +335,8 @@ def patch_pangu():
     SpeculativeConfig.__post_init__ = __post_init__
     SpeculativeConfig.hf_config_override = hf_config_override
     SpeculativeConfig.use_eagle = use_eagle
+
+    patch_chat_utils()
 
     from omni.adaptors.vllm.reasoning import register_reasoning
     from omni.adaptors.vllm.entrypoints.openai.tool_parsers import register_tool

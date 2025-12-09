@@ -787,6 +787,10 @@ class AscendTopKTopPSamplerV1(TopKTopPSampler):
 
         The logits tensor may be updated in-place.
         """
+        if os.getenv("OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE", "0") == "1":
+            logits, idx = apply_top_k_top_p(logits, k, p)
+            probs = logits.softmax(dim=-1, dtype=torch.float32)
+            return random_sample(probs, idx, generators, self.dsa_stream)
         logits = logits.type(torch.bfloat16)
         if p is not None:
             p = p.type(torch.bfloat16)

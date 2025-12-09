@@ -13,7 +13,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
-import zmq
+import socket
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
@@ -50,7 +50,13 @@ GET_META_MSG = b"get_meta_msg"
 thread_dump_path = os.environ.get("VLLM_THREAD_DUMP_PATH", "/tmp/vllm_thread_info")
 BLOCK_RELEASE_DELAY = int(os.environ.get("BLOCK_RELEASE_DELAY", 600))  # seconds, use to free blocks when the request is finished for a long time 
 
-from omni.accelerators.pd.llmdatadist_manager import LLMDataDistManager, LLMDataDistConfig
+if os.getenv("ENABLE_DYNAMIC_LLMDATADIST", "0") == "1":
+    FLAG_ENABLE_DYNAMIC_LLMDATADIST = True
+    LLMDATADIST_BASE_PORT = int(os.environ.get("VLLM_LLMDATADIST_BASE_PORT", 15567))
+    from omni.accelerators.pd.llmdatadist_manager_v1 import LLMDataDistManager, LLMDataDistConfig
+else:
+    FLAG_ENABLE_DYNAMIC_LLMDATADIST = False
+    from omni.accelerators.pd.llmdatadist_manager import LLMDataDistManager, LLMDataDistConfig
 from omni.tools.profiler.apply_profiler_patches import patch_request
 patch_request()
 
@@ -119,9 +125,16 @@ class LLMDataDistConnector(KVConnectorBase_V1):
             vllm_config.kv_transfer_config.kv_parallel_size = 1
             logger.info("Set kv_parallel_size to 1 when use deepseek mla model.")
 
-        self.datadist_config = LLMDataDistConfig(vllm_config, ignore_load_rank=True)
-        self.cluster_id_start = self.datadist_config.cluster_id_start
-        self.host_ip = self.datadist_config.local_group.host_ip
+        if FLAG_ENABLE_DYNAMIC_LLMDATADIST:
+            local_host_ip = get_local_ip()
+            local_host_port = LLMDATADIST_BASE_PORT
+            self.datadist_config = LLMDataDistConfig(vllm_config, local_host_ip, local_host_port, ignore_load_rank=True)
+            self.host_cluster_id = self.datadist_config.host_cluster_id
+            self.host_ip = local_host_ip
+        else:
+            self.datadist_config = LLMDataDistConfig(vllm_config, ignore_load_rank=True)
+            self.host_cluster_id = self.datadist_config.cluster_id_start
+            self.host_ip = self.datadist_config.local_group.host_ip
         # Introduce the environment variable VLLM_LLMDATADIST_ZMQ_PORT to resolve ZMQ connection conflicts during
         # multi-P deployments on the same machine.
         # This variable should not be set separately unless specifically required for this scenario.
@@ -133,7 +146,7 @@ class LLMDataDistConnector(KVConnectorBase_V1):
 
         if role == KVConnectorRole.SCHEDULER:
             if self.is_prefill:
-                self.connector_scheduler = PrefillConnectorScheduler(vllm_config, self.cluster_id_start, self.host_ip, str(self.host_port), str(self.host_port + 1000))
+                self.connector_scheduler = PrefillConnectorScheduler(vllm_config, self.host_cluster_id, self.host_ip, str(self.host_port), str(self.host_port + 1000))
             else:
                 self.connector_scheduler = DecodeConnectorScheduler(vllm_config, str(self.host_port + 2000))
             self.connector_worker = None
@@ -141,7 +154,7 @@ class LLMDataDistConnector(KVConnectorBase_V1):
             if self.is_prefill:
                 self.connector_worker = PrefillConnectorWorker(vllm_config, str(self.host_ip), str(self.host_port), str(self.host_port + 1000))
             else:
-                self.connector_worker = DecodeConnectorWorker(vllm_config, str(self.host_ip), self.cluster_id_start, str(self.host_port + 2000))
+                self.connector_worker = DecodeConnectorWorker(vllm_config, str(self.host_ip), self.host_cluster_id, str(self.host_port + 2000))
             self.connector_scheduler = None
 
     ############################################################
@@ -224,13 +237,13 @@ class LLMDataDistConnector(KVConnectorBase_V1):
 class PrefillConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config, cluster_id_start: str, host_ip: str, host_port: str, trace_p_port: str):
+    def __init__(self, vllm_config, host_cluster_id: str, host_ip: str, host_port: str, trace_p_port: str):
         self.vllm_config = vllm_config
-        self.cluster_id_start = cluster_id_start
+        self.host_cluster_id = host_cluster_id
         self.host_ip = host_ip
         self.host_port = host_port
         self.trace_p_port=trace_p_port
-        logger.info("Initializing LLMDataDist Scheduler %s %s %s", cluster_id_start, host_ip, host_port)
+        logger.info("Initializing LLMDataDist Scheduler %s %s %s", host_cluster_id, host_ip, host_port)
         # initialize the dict to save requests finish time
         self.requests_finish_time = dict()
         # req_id -> headers
@@ -305,7 +318,7 @@ class PrefillConnectorScheduler:
 
         return delay_free_blocks, dict(
             remote_block_ids=block_ids,
-            remote_cluster_id=self.cluster_id_start,
+            remote_cluster_id=self.host_cluster_id,
             remote_host_ip=f"tcp://{self.host_ip}:{self.host_port}",
             spec_token_ids=spec_token_ids,
             remote_dp_rank=self.vllm_config.parallel_config.data_parallel_rank,
@@ -343,15 +356,18 @@ class PrefillConnectorWorker:
             if use_omni_attn_mgr:
                 manager_cls = OmniBiGroupDataDistManager
                 logger.warning(f"PrefillingConnector is using Omni datadist manager for KV transfer.")
-        self.datadist_manager = manager_cls(vllm_config)
+        if FLAG_ENABLE_DYNAMIC_LLMDATADIST:
+            self.datadist_manager = manager_cls(vllm_config, self.host_ip, LLMDATADIST_BASE_PORT)
+        else:
+            self.datadist_manager = manager_cls(vllm_config)
 
         # initialize the dict to save requests finish time
         self.requests_finish_time = dict()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.datadist_manager.register_memory(kv_caches)
-        self.datadist_manager.register_link()
-        pass
+        if not FLAG_ENABLE_DYNAMIC_LLMDATADIST:
+            self.datadist_manager.register_link()
 
     def start_load_kv(self, metadata: DatadistConnectorMetadataPrefill):
         pass
@@ -401,9 +417,11 @@ class PrefillConnectorWorker:
         return all_done_sending, all_done_recving
 
     def get_pulled_kv_req_list(self):
-        path_p = f"tcp://{self.host_ip}:{self.trace_p_port}"
-        socket_p = self.ctx.socket(zmq.PUSH)
-        socket_p.connect(path_p)
+        if os.getenv("PROFILING_NAMELIST", None):
+            path_p = f"tcp://{self.host_ip}:{self.trace_p_port}"
+            socket_p = self.ctx.socket(zmq.PUSH)
+            socket_p.connect(path_p)
+
         while True:
             try:
                 if self.input_socket.poll(timeout=10) > 0:
@@ -575,9 +593,9 @@ class DecodeConnectorScheduler:
 class DecodeConnectorWorker:
     """Worker implementation for datadist."""
 
-    def __init__(self, vllm_config: "VllmConfig", host_ip: str, cluster_id_start: int, trace_d_port: str):
+    def __init__(self, vllm_config: "VllmConfig", host_ip: str, host_cluster_id: int, trace_d_port: str):
         self.vllm_config = vllm_config
-        self.cluster_id_start = cluster_id_start
+        self.host_cluster_id = host_cluster_id
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank_local
         self.tp_rank = get_tensor_model_parallel_rank()
         additional_config = vllm_config.additional_config
@@ -603,7 +621,10 @@ class DecodeConnectorWorker:
             if use_omni_attn_mgr:
                 manager_cls = OmniBiGroupDataDistManager
                 logger.warning(f"DecodeConnector is using Omni datadist manager for KV transfer.")
-        self.datadist_manager = manager_cls(vllm_config)
+        if FLAG_ENABLE_DYNAMIC_LLMDATADIST:
+            self.datadist_manager = manager_cls(vllm_config, host_ip, 0)
+        else:
+            self.datadist_manager = manager_cls(vllm_config)
 
         self._recving_transfers: list = []
         self._done_recving_count: defaultdict[str, int] = defaultdict(lambda: 0)
@@ -704,9 +725,11 @@ class DecodeConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.datadist_manager.register_memory(kv_caches)
-        self.datadist_manager.register_link()
+        if not FLAG_ENABLE_DYNAMIC_LLMDATADIST:
+            self.datadist_manager.register_link()
         # put multi-thread_pull_kv and multi_rank_pull_kv related registered_link_infos into queues
-        if self.multi_rank_pull_kv or self.multi_thread_pull_kv:
+        # TODO: currently only support multi-thread_pull_kv and multi_rank_pull_kv for old datadist api
+        if self.multi_rank_pull_kv or self.multi_thread_pull_kv and not FLAG_ENABLE_DYNAMIC_LLMDATADIST:
             # In multi_rank_pull_kv mode, we create a thread for each P rank's cluster_id
             logger.info(f" ***** registered_link_infos: {self.datadist_manager.registered_link_infos}")
             for (cluster_id_start, prefill_dp_rank, d_rank), cluster_ids in self.datadist_manager.registered_link_infos.items():
@@ -796,8 +819,11 @@ class DecodeConnectorWorker:
             else:
                 logger.error(f"Unexpected type for meta.local_block_ids[0]: {type(meta.local_block_ids[0])}")
                 raise RuntimeError(f"Unexpected type for meta.local_block_ids[0]: {type(meta.local_block_ids[0])}")
-            cluster_ids = self.datadist_manager.get_real_remote_cluster_ids(meta)
-            if self.multi_rank_pull_kv:
+            if os.getenv("ENABLE_PD_MOCKUP", "0") == "1":
+                cluster_ids = [0]
+            else:
+                cluster_ids = self.datadist_manager.get_real_remote_cluster_ids(meta)
+            if self.multi_rank_pull_kv and not FLAG_ENABLE_DYNAMIC_LLMDATADIST:
                 # If multi_rank_pull_kv is enabled, each DP rank will pull kv from multiple P ranks
                 # and the cluster_ids are obtained from registered_link_infos
                 # If the local_block_ids is a flat list of int, we can directly use it
@@ -838,11 +864,12 @@ class DecodeConnectorWorker:
                             'local_block_ids': local_blocks,
                             'remote_block_ids': remote_blocks,
                             'remote_host_ip': meta.remote_host,
+                            'prefill_dp_rank': meta.remote_dp_rank,
                             'trace_headers': meta.trace_headers  or {},
                         }
                         logger.warning(f"*********** dst cluster_id is {cluster_id}.")
                         self.queues[cluster_id].put(task)
-            elif self.multi_thread_pull_kv:
+            elif self.multi_thread_pull_kv and not FLAG_ENABLE_DYNAMIC_LLMDATADIST:
                 task = {
                     'request_id': req_id,
                     'remote_request_id': meta.remote_request_id,
@@ -850,6 +877,7 @@ class DecodeConnectorWorker:
                     'local_block_ids': meta.local_block_ids,
                     'remote_block_ids': meta.remote_block_ids,
                     'remote_host_ip': meta.remote_host,
+                    'prefill_dp_rank': meta.remote_dp_rank,
                     'trace_headers': meta.trace_headers  or {},
                 }
 
@@ -864,11 +892,12 @@ class DecodeConnectorWorker:
                     request_id=req_id,
                     remote_request_id=meta.remote_request_id,
                     remote_host_ip=meta.remote_host,
+                    prefill_dp_rank=meta.remote_dp_rank,
                     trace_headers=meta.trace_headers,
                 )
                 futures.append(future)
 
-        if not self.multi_thread_pull_kv:
+        if not self.multi_thread_pull_kv or FLAG_ENABLE_DYNAMIC_LLMDATADIST:
             for future in futures:
                 future.add_done_callback(handle_exception)
 
@@ -880,13 +909,17 @@ class DecodeConnectorWorker:
         request_id: str,
         remote_request_id: str,
         remote_host_ip: str,
+        prefill_dp_rank: int,
         trace_headers: Optional[Mapping[str, str]] = None
     ):
         start = time.time()
         if hasattr(self.vllm_config.model_config.hf_config, 'param_sink_with_value'):
             local_block_ids.insert(0, 0)
             remote_block_ids.insert(0, 0)
-        self.datadist_manager.pull_kv(remote_block_ids, local_block_ids, dst_cluster_id)
+        if FLAG_ENABLE_DYNAMIC_LLMDATADIST:
+            self.datadist_manager.pull_kv(remote_block_ids, local_block_ids, dst_cluster_id, prefill_dp_rank)
+        else:
+            self.datadist_manager.pull_kv(remote_block_ids, local_block_ids, dst_cluster_id)
 
         if self.vllm_config.parallel_config.tensor_parallel_size == 1:
             # tp=1, send to prefill tp rank0 directly.
@@ -925,19 +958,25 @@ class DecodeConnectorWorker:
             socket.connect(path)
             self.zmq_socket_map[path] = socket
             logger.info(f"create new socket path:{path}")
-
-        path_d = f"tcp://{self.host_ip}:{self.trace_d_port}"
-        socket_d = self.ctx.socket(zmq.PUSH)
-        socket_d.connect(path_d)
-
         try:
             json_data = json.dumps(data)
             socket.send_string(json_data)
             logger.info(f"send string {json_data} path:{path}")
-            if os.getenv("PROFILING_NAMELIST", None):
-                socket_d.send_string(json_data)
         except Exception as e:
             logger.error(f"Failed to send reqest_id {json_data} to prefill: {e}")
+        
+        if os.getenv("PROFILING_NAMELIST", None):
+            path_d = f"tcp://{self.host_ip}:{self.trace_d_port}"
+            if path_d in self.zmq_socket_map:
+                socket_d = self.zmq_socket_map[path_d]
+            else:
+                socket_d = self.ctx.socket(zmq.PUSH)
+                socket_d.connect(path_d)
+                self.zmq_socket_map[path_d] = socket_d
+            try:
+                socket_d.send_string(json_data)
+            except Exception as e:
+                logger.error(f"Failed to send {json_data} to DecodeConnectorScheduler: {e}")
 
     def get_finished(self, metadata: DatadistConnectorMetadata) -> tuple[set[str], set[str]]:
         # for decode size, done_sending is no need

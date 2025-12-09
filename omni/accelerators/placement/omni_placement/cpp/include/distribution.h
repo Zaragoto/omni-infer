@@ -33,6 +33,10 @@ enum SwapDirection {
         if (ret != ACL_SUCCESS) {                                              \
             printf("acl interface return err %s:%d, retcode: %d \n", __FILE__, \
                    __LINE__, ret);                                             \
+            char buf[256];                                                     \
+            std::snprintf(buf, sizeof(buf), "acl check error %s::%d.",         \
+                          __FILE__, __LINE__);                                 \
+            throw std::runtime_error(buf);                                     \
         }                                                                      \
     } while (0)
 
@@ -41,6 +45,10 @@ enum SwapDirection {
         if (ret != HCCL_SUCCESS) {                                             \
             printf("hccl interface return err %s:%d, retcode: %d \n",          \
                    __FILE__, __LINE__, ret);                                   \
+            char buf[256];                                                     \
+            std::snprintf(buf, sizeof(buf), "hccl check error %s::%d.",        \
+                          __FILE__, __LINE__);                                 \
+            throw std::runtime_error(buf);                                     \
         }                                                                      \
     } while (0)
 

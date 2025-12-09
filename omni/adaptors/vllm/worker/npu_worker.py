@@ -78,6 +78,9 @@ class NPUWorker(WorkerBase):
             # Additional parameters for compatibility with vllm
             **kwargs):
         """Initialize the worker for Ascend."""
+        if envs.VLLM_LOGGING_CONFIG_PATH:
+            from vllm.logger import _configure_vllm_root_logger
+            _configure_vllm_root_logger()
 
         if envs.VLLM_ENABLE_V1_MULTIPROCESSING:
             if envs.VLLM_USE_RAY_SPMD_WORKER:
@@ -336,12 +339,15 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            if not self.profile_already_start and self._profile_start_requested:
-                self.profiler.start()
-                self.profile_already_start = True
-                self.profile_step = 0
-                self._profile_start_requested = False  
+        if (envs.VLLM_TORCH_PROFILER_DIR and not self.profile_finished and
+            not self.profile_already_start and
+            ((self._use_token and scheduler_output.total_num_scheduled_tokens >= self.profiler_token_threshold) or
+            (not self._use_token and self._profile_start_requested))):
+            self.profiler.start()
+            self.profile_already_start = True
+            self.profile_step = 0
+            if not self._use_token:
+                self._profile_start_requested = False
 
         output = self.execute_model_wrapper(scheduler_output)
         if isinstance(output, dict):
@@ -490,6 +496,7 @@ class NPUWorker(WorkerBase):
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
         # PROFILER_TOKEN_THRESHOLD=1
         # PROFILER_STOP_STEP=5
+        self._use_token = os.getenv("PROFILER_TOKEN_THRESHOLD") is not None
         self.profile_already_start = True
         self.profile_step = 0
         self.profile_finished = True

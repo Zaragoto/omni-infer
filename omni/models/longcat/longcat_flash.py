@@ -39,7 +39,7 @@ from omni.layers.moe.fused_moe.layer import FusedMoE
 from omni.models.config_loader.loader import model_extra_config
 from omni.models.longcat.longcat_moe import LongcatFlashMoE
 from omni.layers.attention.deepseek_mla import DeepseekMLA
-from omni.models.deepseek.deepseek_v3 import ParallelDeepseekMLP
+from omni.layers.moe.deepseek_moe import ParallelDeepseekMLP
 
 
 """MLP module activation split length, split by 64G VRAM, need to confirm the optimal split length based on sequence length and performance"""

@@ -27,7 +27,8 @@
 
   vars:
     # Configure the storage path of the ranktable file.
-    ranktable_save_path: "/tmp/ranktable_save_path"
+    default_ranktable_save_path: "/tmp/ranktable_save_path"
+    ranktable_save_path: "{{ (hostvars[inventory_hostname].env | default({})).get('RANKTABLE_SAVE_PATH', default_ranktable_save_path) }}"
 
     docker_exec_cmd: |
       docker exec \
@@ -37,8 +38,8 @@
 
       . ~/.bashrc
 
-      rm -rf ${PREFILL_RANKTABLE_SAVE_PATH}
-      mkdir -p ${PREFILL_RANKTABLE_SAVE_PATH}
+      # rm -rf ${PREFILL_RANKTABLE_SAVE_PATH}
+      # mkdir -p ${PREFILL_RANKTABLE_SAVE_PATH}
       python /workspace/omniinfer/tools/scripts/pd_ranktable_tools.py --mode gen --prefill-server-list "${PREFILL_SERVER_LIST}" --api-server --save-dir ${PREFILL_RANKTABLE_SAVE_PATH}
 
     generate_decode_ranktable_cmd: |
@@ -46,8 +47,8 @@
 
       . ~/.bashrc
 
-      rm -rf ${DECODE_RANKTABLE_SAVE_PATH}
-      mkdir -p ${DECODE_RANKTABLE_SAVE_PATH}
+      # rm -rf ${DECODE_RANKTABLE_SAVE_PATH}
+      # mkdir -p ${DECODE_RANKTABLE_SAVE_PATH}
       python /workspace/omniinfer/tools/scripts/pd_ranktable_tools.py --mode gen --decode-server-list ${DECODE_SERVER_LIST} --save-dir ${DECODE_RANKTABLE_SAVE_PATH}
 
     generate_global_ranktable_cmd: |
@@ -246,12 +247,68 @@
         DOCKER_NAME_P: "{{ ACTUAL_DOCKER_NAME_P }}"
       when: "'P' in group_names"
       tags: ranktable
+  
+    - name: Print generated ranktable files in the prefill instances.
+      block:
+      - name: Check if directory exists
+        stat:
+          path: "{{ ranktable_save_path }}/prefill_config"
+        register: dir_stat
+      - name: Get the files
+        command: bash -c "ls {{ ranktable_save_path }}/prefill_config"
+        register: ranktable_dir_listing
+        changed_when: false
+        when: dir_stat.stat.exists and dir_stat.stat.isdir
+      - name: Print out
+        debug:
+          msg: >-
+            [Ranktable Info]
+            Host: {{ inventory_hostname }} 
+            Ranktable save path: {{ ranktable_save_path }}/prefill_config
+            Generated File: {{ ranktable_dir_listing.stdout_lines | join('\n') }}
+        when: dir_stat.stat.exists and dir_stat.stat.isdir
+      - name: Warn if directory doesn't exist
+        debug:
+          msg: >-
+            [Ranktable Info]
+            Directory {{ ranktable_save_path }}/prefill_config/ does not exist on {{ inventory_hostname }}
+        when: not dir_stat.stat.exists or not dir_stat.stat.isdir
+      when: "'P' in group_names"
+      tags: ranktable
 
     - name: Generate the ranktable file in the decode instances.
       command: bash -c "{{ docker_generate_decode_ranktable_cmd }}"
       environment:
         DECODE_SERVER_LIST: "{{ ascend_rt_visible_devices }}"
         DOCKER_NAME_D: "{{ ACTUAL_DOCKER_NAME_D }}"
+      when: "'D' in group_names"
+      tags: ranktable
+
+    - name: Print generated ranktable files in the decode instances.
+      block:
+      - name: Check if directory exists
+        stat:
+          path: "{{ ranktable_save_path }}/decode_config"
+        register: dir_stat
+      - name: Get the files
+        command: bash -c "ls {{ ranktable_save_path }}/decode_config"
+        register: ranktable_dir_listing
+        changed_when: false
+        when: dir_stat.stat.exists and dir_stat.stat.isdir
+      - name: Print out
+        debug:
+          msg: >-
+            [Ranktable Info]
+            Host: {{ inventory_hostname }} 
+            Ranktable save path: {{ ranktable_save_path }}/decode_config
+            Generated File: {{ ranktable_dir_listing.stdout_lines | join('\n') }}
+        when: dir_stat.stat.exists and dir_stat.stat.isdir
+      - name: Warn if directory doesn't exist
+        debug:
+          msg: >-
+            [Ranktable Info]
+            Directory {{ ranktable_save_path }}/decode_config/ does not exist on {{ inventory_hostname }}
+        when: not dir_stat.stat.exists or not dir_stat.stat.isdir
       when: "'D' in group_names"
       tags: ranktable
 
@@ -331,3 +388,4 @@
         dest: "{{ ranktable_save_path }}/global/"
       when: "inventory_hostname != groups['P'][0]"
       tags: ranktable
+

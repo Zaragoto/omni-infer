@@ -69,6 +69,7 @@ class ModelParallelConfig:
     attn_sp_size: int = 1
     redundancy_shared_expert_num: int = 0
     attn_dies: int = 0
+    enable_share_expert_tp: bool = False
     eh_proj_tp_size: int = 1
 
  
@@ -112,7 +113,7 @@ class ModelOperatorOptConfig:
     tp_nnodes: int = 1
     c8_calib_path: str = None # 计算faquant的scale采集的kv_cache的calib地址，在test_config_prefill.json赋值
     experts_pruning: bool = False
-    use_tnd_pa: bool = False  # 稠密模型使用新CANN包FIA算子，以TND+PA格式计算attention
+    use_tnd_pa: bool = True  # 稠密模型使用新CANN包FIA算子，以TND+PA格式计算attention
 
     enable_dsa: bool = False # 使能mla = Indexer + select FA
     enable_indexer_quant: bool = False # 使能indexer量化
@@ -125,6 +126,7 @@ class ModelOperatorOptConfig:
     ascend_operator_fusion_pass_set: str = '' #用于控制关闭算子融合，为空代表不关闭任何算子融合
 
     enable_mlp_seq_split: bool = False # 模型大 + 权重大 + 长序列场景下会OOM，需要切分长度时打开以避免OOM，默认切分大小为4096
+    enable_mla_prefill_multistream: bool = False # mla prefill阶段qkv计算启用多流
     decode_experts_pruning: bool = False
     new_w4_op: bool = False # w4a8新算子
     enable_c8: bool = False # GQA使能C8
@@ -137,6 +139,10 @@ class ModelOperatorOptConfig:
             self.expert_gate_up_prefetch = 0
             self.expert_down_prefetch = 0
             self.attn_prefetch = 0
+            self.dense_mlp_prefetch = 0
+            self.lm_head_prefetch = 0
+            self.shared_expert_gate_up_prefetch = 0
+            self.shared_expert_down_prefetch = 0
             logger.warning(f"[WARNING] When enable_prefetch is false, prefetch_Mb must be set to 0.")
 
             

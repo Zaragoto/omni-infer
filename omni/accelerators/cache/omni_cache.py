@@ -205,6 +205,8 @@ class PrefillOmniCache(BaseOmniCache):
         self.h2d_stream = torch.npu.Stream(device=self.device)
         self.h2d_event = torch.npu.Event(blocking=False, enable_timing=False)
 
+        self._nz_size = NZ_DIM
+
     # def calc_cache_shape(self) -> Tuple[Tuple[int, ...], int]:
     #     self.tp_node_id = self.tp_rank // NUM_DIE_PER_MACH
     #     self.tp_nnodes = divide_or_raise(self.tp_world_size, NUM_DIE_PER_MACH)
@@ -385,6 +387,23 @@ class PrefillOmniCache(BaseOmniCache):
                 model_extra_config.parall_config.attn_sp_size * 2,
                 pad_slot_id
             )
+        else:
+            orig_slot_mapping = generate_full_block_slot(
+                orig_slot_mapping,
+                query_lens_list,
+                self.block_size
+            )
+        query_lens_tensor = torch.tensor(query_lens_list)
+        padding_lens_tensor = (self.block_size - query_lens_tensor % self.block_size) % self.block_size
+        total_lens_list = (query_lens_tensor + padding_lens_tensor).tolist()
+        self.sum_total_len = sum(total_lens_list)
+        self.sum_query_len = sum(query_lens_list)
+        self.query_mask = torch.zeros(self.sum_total_len, dtype = torch.bool)
+        start = 0
+        for ql, tl in zip(query_lens_list, total_lens_list):
+            self.query_mask[start:start+ql] = 1
+            start += tl
+
         blocks, slots = orig_slot_mapping // self.block_size, orig_slot_mapping % self.block_size
         ranks, rank_slots = slots // self.rank_block_size, slots % self.node_block_size
         token_idx = torch.nonzero((ranks == self.tp_rank) & (orig_slot_mapping > 0), as_tuple=True)[0]
@@ -534,22 +553,45 @@ class PrefillOmniCache(BaseOmniCache):
     ) -> None:
         if self.copy_future is not None and not self.copy_future.done():
             self.copy_future.result()
-        num_tokens = kv_states[0].shape[0]
         d2h_event = torch.npu.Event(blocking=False, enable_timing=False)
         with torch.npu.stream(self.d2h_stream):
             num_tokens = self.batch_token_indices.shape[0]
             self.d2h_stream.wait_event(kv_event)
             for i in range(len(kv_states)):
                 self.batch_buffer_cpu[i][:num_tokens].copy_(
-                    kv_states[i].squeeze(1)[self.batch_token_indices], non_blocking=True)
+                    self._nd_to_nz(kv_states[i].squeeze(1)), non_blocking=True)
             d2h_event.record(self.d2h_stream)
 
-        for i in range(len(kv_states)):
-            kv_states[i].record_stream(self.d2h_stream)
         self.copy_future = self.d2h_thrp.submit(
             self._update_host_cache_thread,
             num_tokens, layer_idx, d2h_event,
         )
+    
+    def _padding_kv_cache(self, tensor):
+        result = torch.zeros((self.sum_total_len, *tensor.shape[1:]), dtype=tensor.dtype, device = tensor.device)
+        result[self.query_mask] = tensor[:self.sum_query_len]
+        return result
+    
+    def _nd_to_nz(self, tensor):
+        # Padding KVCache per Req to full Block
+        tensor = self._padding_kv_cache(tensor)
+
+        # [global_num_tokens, hidden_size]
+        golbal_num_tokens = tensor.size(0)
+
+        # [num_blocks, block_size, num_nz, nz_dim]
+        tensor = tensor.view(golbal_num_tokens//self.block_size, self.block_size, -1, self._nz_size)
+
+        # [num_blocks, num_nz, block_size, nz_dim] by Permute & Contiguous
+        tensor = tensor.permute(0, 2, 1, 3).contiguous()
+
+        # view to fake global num_tokens
+        tensor = tensor.view(golbal_num_tokens, -1)
+
+        # Get local num tokens by Rank index
+        tensor = tensor[self.batch_token_indices]
+
+        return tensor
 
     def _update_host_cache_thread(self, num_tokens, layer_idx, event):
         torch.npu.set_device(self.device)
@@ -734,48 +776,33 @@ class DecodeOmniCache(BaseOmniCache):
                     raise ValueError("Unknown KV cache spec type.")
         return kv_caches
 
-    def synchronize_h2d(self, local_block_ids: List[List[int]], tp_nnodes: int = 1) -> None:
+    def build_h2d_ops(self, local_block_ids: List[List[int]], tp_nnodes: int = 1) -> None:
         if len(local_block_ids) > 1:
-            self.synchronize_h2d_omni_attn(local_block_ids)
-            return
-
-        layer_indices = self.device_cache.keys()
-        npu_blocks = []
-        device_id = None
-        for block_id in local_block_ids[0]:
-            layers = []
-            for layer_name in layer_indices:
-                if device_id is None:
-                    device_id = self.device_cache[layer_name][0][block_id].device.index
-                if model_extra_config.operator_opt_config.enable_dsa:
-                    layers.append(
-                        (
-                            # only keep k_indexer cache on device
-                            self.device_cache[layer_name][0][block_id],
-                        )
-                    )
-                else:
-                    layers.append(
-                        (
-                            self.device_cache[layer_name][0][block_id],
-                            self.device_cache[layer_name][1][block_id]
-                        )
-                    )
-            npu_blocks.append(layers)
-        # self.host_cache.batch_layer_copy_to_npu(local_block_ids[0], npu_blocks, device_id)
-        # change copy back to with max batch size to avoid out-of-range error in ACL
-        if model_extra_config.operator_opt_config.enable_dsa:
-            blc_num_batch = 50
+            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes = self.build_h2d_ops_omni_attn(local_block_ids)
         else:
-            blc_num_batch = 20
-        for idx_blc in range((len(local_block_ids[0]) + blc_num_batch - 1) // blc_num_batch):
-            if (idx_blc + 1) * blc_num_batch > len(local_block_ids[0]):
-                end_idx = len(local_block_ids[0])
-            else:
-                end_idx = (idx_blc + 1) * blc_num_batch
-            self.host_cache.batch_layer_copy_to_npu(local_block_ids[0][idx_blc*blc_num_batch:end_idx],
-                                                    npu_blocks[idx_blc*blc_num_batch:end_idx], device_id)
-
+            layer_indices = self.device_cache.keys()
+            npu_blocks = []
+            for block_id in local_block_ids[0]:
+                layers = []
+                for layer_name in layer_indices:
+                    if model_extra_config.operator_opt_config.enable_dsa:
+                        layers.append(
+                            (
+                                # only keep k_indexer cache on device
+                                self.device_cache[layer_name][0][block_id],
+                            )
+                        )
+                    else:
+                        layers.append(
+                            (
+                                self.device_cache[layer_name][0][block_id],
+                                self.device_cache[layer_name][1][block_id]
+                            )
+                        )
+                npu_blocks.append(layers)
+            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes = self.host_cache.batch_layer_copy_to_npu(local_block_ids[0], npu_blocks)
+        
+        return batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes
 
     def synchronize_h2d_layerwise(self, local_block_ids: List[List[int]], layer_id: int = 0) -> None:
         layer_indices = self.device_cache.keys()
@@ -819,8 +846,10 @@ class DecodeOmniCache(BaseOmniCache):
                                                     npu_blocks[idx_blc*blc_num_batch:end_idx], device_id,
                                                     layer_indices=[layer_id])
 
+    def synchronize_h2d(self, batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes):
+        self.host_cache.memcpy_async(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes)
 
-    def synchronize_h2d_omni_attn(self, local_block_ids: List[List[int]]) -> None:
+    def build_h2d_ops_omni_attn(self, local_block_ids: List[List[int]]) -> None:
         if model_extra_config.operator_opt_config.enable_dsa:
             raise RuntimeError("Omni attention does not support DSV3.2 model yet.")
         if len(local_block_ids) != 2:
@@ -837,15 +866,13 @@ class DecodeOmniCache(BaseOmniCache):
 
         src_blocks = [local_block_ids[0], host_omni_blocks]
         tgt_blocks = local_block_ids
-        device_id = None
-
+        
+        batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes = [], [], [], []
         for i, (src, tgt) in enumerate(zip(src_blocks, tgt_blocks)):
             npu_blocks = []
             for block_id in tgt:
                 layers = []
                 for layer_name in self.sorted_layer_names:
-                    if device_id is None:
-                        device_id = self.device_cache[layer_name][0].device.index
                     layer_idx = self.layer_indices[layer_name]
                     if self.omni_attn_pattern[layer_idx] != i:
                         continue
@@ -856,21 +883,14 @@ class DecodeOmniCache(BaseOmniCache):
                         )
                     )
                 npu_blocks.append(layers)
-            # self.host_cache.batch_layer_copy_to_npu(src, npu_blocks, device_id, layer_indices=self.grouped_layer_indices[i])
-            # change copy back to with max batch size to avoid out-of-range error in ACL
-            if model_extra_config.operator_opt_config.enable_dsa:
-                blc_num_batch = 50
-            else:
-                blc_num_batch = 20
-            for idx_blc in range((len(src) + blc_num_batch - 1) // blc_num_batch):
-                if (idx_blc + 1) * blc_num_batch > len(src):
-                    end_idx = len(src)
-                else:
-                    end_idx = (idx_blc + 1) * blc_num_batch
-                self.host_cache.batch_layer_copy_to_npu(src[idx_blc*blc_num_batch:end_idx],
-                                                        npu_blocks[idx_blc*blc_num_batch:end_idx],
-                                                        device_id, layer_indices=self.grouped_layer_indices[i])
-
+            micro_batch_device_mem, micro_batch_device_max, micro_batch_host_mem, micro_batch_host_sizes = self.host_cache.batch_layer_copy_to_npu(src, npu_blocks, layer_indices=self.grouped_layer_indices[i])
+            batch_device_mem.extend(micro_batch_device_mem)
+            batch_device_max.extend(micro_batch_device_max)
+            batch_host_mem.extend(micro_batch_host_mem)
+            batch_host_sizes.extend(micro_batch_host_sizes)
+        
+        return batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes
+    
     def synchronize_d2h(self, key_states: torch.Tensor, value_states: torch.Tensor, slot_mapping: torch.Tensor, layer_idx: int, kv_event: torch.npu.Event) -> None:
         raise NotImplementedError
 
@@ -961,6 +981,24 @@ class PrefixCopyMeta:
 
         self.num_copy_blocks = total_copy_blocks
 
+def generate_full_block_slot(slot_mapping, query_lens, block_size):
+    blocks = slot_mapping // block_size
+    device = slot_mapping.device
+    index_per_block = torch.arange(block_size, dtype=slot_mapping.dtype, device=device)
+    result = []
+    start = 0
+    for query_len in query_lens:
+        end = start + query_len
+        num_block = math.ceil((end-start)/block_size)
+        query_blocks = blocks[start:end]
+        block_index = torch.arange(num_block, device= device) * block_size
+        query_blocks = query_blocks[block_index]
+        query_slot = index_per_block.repeat(num_block, 1)
+        query_slot = query_slot + (query_blocks * block_size).unsqueeze(1)
+        result.append(query_slot)
+        start = end
+    result = torch.concat(result, dim=0).view(-1)
+    return result
 
 def pad_inputs(input: torch.Tensor, query_lens: list[int], sp_size: int, pad_value: int):
     count = 0

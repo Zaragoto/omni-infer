@@ -1,8 +1,27 @@
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# This file is a part of the vllm-ascend project.
+#
+# This file is mainly Adapted from vllm-project/vllm/v1/spec_decode/eagle.py
+# Copyright 2023 The vLLM team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 from typing import Dict, List, Optional
 import torch
 import torch_npu
-
+import os
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.penalties import apply_min_token_penalties
@@ -107,7 +126,7 @@ class AscendSamplerV1(SamplerV1):
         self.sampling_eps = torch.ones((1,), device=runner.device, dtype=torch.float32) * _SAMPLING_EPS
         self.sampler_preparing_stream = torch.npu.Stream()
         self.penalty_cache = PenaltyCache(runner.max_num_reqs, runner.input_batch.vocab_size, runner.device) if runner.use_penalty else None
-        self.prob_cache = ProbCache(runner.max_num_reqs, runner.num_tokens_per_reqs_decode - 1, runner.topk, runner.input_batch.vocab_size, runner.device) if runner.use_rejection_sampler else None
+        self.prob_cache = ProbCache(runner.max_num_reqs, runner.num_tokens_per_reqs_decode, runner.input_batch.vocab_size, runner.device) if runner.use_rejection_sampler else None
         self.topk_topp_sampler = AscendTopKTopPSamplerV1()
 
     def expand_sampling_metadata(
@@ -224,27 +243,40 @@ class AscendSamplerV1(SamplerV1):
                 logits_or_prob = logits
                 is_logits = True
 
+            p = sampling_metadata.top_p
+            k = sampling_metadata.top_k
+
+            if os.getenv("OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE", "0") == "1" or (k is None and p is None):
+                probs, idx = apply_top_k_top_p(
+                    logits_or_prob, k, p, is_logits,
+                )
+                if do_sample:
+                    return self.do_sample(
+                        probs, idx, sampling_metadata, spec_metadata,
+                    )
+                else:
+                    return probs, idx
+
+            logits = logits_or_prob.type(torch.bfloat16)
+            if p is not None:
+                p = p.type(torch.bfloat16)
+            else:
+                p = torch.ones(logits.shape[0], dtype=torch.bfloat16, device=logits.device)
+            if k is not None:
+                k = k.type(torch.int32)
+            else:
+                k = torch.ones((logits.shape[0],), dtype=torch.int32, device=logits.device) * logits.shape[1]
+            q = self.generate_random_sequence(
+                logits, sampling_metadata, spec_metadata,
+            ).type(torch.float32)
+
             if do_sample:
-                p = sampling_metadata.top_p
-                k = sampling_metadata.top_k
-                logits = logits_or_prob.type(torch.bfloat16)
-                if p is not None:
-                    p = p.type(torch.bfloat16)
-                else:
-                    p = torch.ones(logits.shape[0], dtype=torch.bfloat16, device=logits.device)
-                if k is not None:
-                    k = k.type(torch.int32)
-                else:
-                    k = torch.ones((logits.shape[0],), dtype=torch.int32, device=logits.device) * logits.shape[1]
-                q = self.generate_random_sequence(
-                    logits, sampling_metadata, spec_metadata,
-                ).type(torch.float32)
                 res = torch_npu.npu_top_k_top_p_sample(logits, k, p, q)
                 return res[0]
             else:
-                return apply_top_k_top_p(
-                    logits_or_prob, sampling_metadata.top_k, sampling_metadata.top_p, is_logits
-                )
+                logits += 20 # TODO: dirty hack, remove npu_top_k_top_p_sample bug fixed
+                res = torch_npu.npu_top_k_top_p_sample(logits, k, p, q, is_need_logits=True)
+                return torch.nn.functional.softmax(res[1], dim=-1), None
         else:
             if do_sample:
                 return logits.argmax(dim=-1)
@@ -350,7 +382,7 @@ class AscendSamplerV1(SamplerV1):
 
                 select_indices = torch.arange(batch_size, device=logits.device) * (spec_metadata.max_spec_len + 1)
                 for i in range(spec_metadata.max_spec_len + 1):
-                    if self.penalty_cache is not None:
+                    if i > 0:
                         self.penalty_cache.save_token_ids(input_ids[token_indices % input_ids.numel()])
                     tmp_logits[select_indices] = _apply_penalties_v1(
                         tmp_logits[select_indices],
@@ -366,6 +398,7 @@ class AscendSamplerV1(SamplerV1):
                     )
                     select_indices += 1
                     token_indices += 1
+                    
 
                 logits = tmp_logits[indices].clone()
         return logits

@@ -94,19 +94,19 @@ index 4d9b53dd6..3356264ac 100644
 +                        num_lookahead_tokens=0,
 +                        delay_cache_blocks=load_kv_async,
 +                    )
-+            if new_blocks is None:
-+                # Let's delay to slow path.
-+                return
++                if new_blocks is None:
++                    # Let's delay to slow path.
++                    return
 +
-+            req.kv_transfer_params["fast_path"] = True
-+            connector.update_state_after_alloc(
-+                        req,
-+                        new_blocks,
-+                        num_external_computed_tokens,
-+                    )
++                req.kv_transfer_params["fast_path"] = True
++                connector.update_state_after_alloc(
++                            req,
++                            new_blocks,
++                            num_external_computed_tokens,
++                        )
 +           
-+            # Kick off pulling kv directly to worker thread
-+            connector.build_connector_meta(None)
++                # Kick off pulling kv directly to worker thread
++                connector.build_connector_meta(None)
 +
      def process_output_socket(self, output_path: str, engine_index: int):
          """Output socket IO thread."""

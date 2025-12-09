@@ -39,8 +39,8 @@ index 60d7097290..241105c221 100644
 +            req_id_head = default
 +        else:
 +            req_id_head = raw_request.headers.get("X-Request-ID")
-+
 +        raw_request_id = self._add_prefix(req_id_head) if req_id_head else request_id
++        logger.warning(f"Raw request ID to return to client: {raw_request_id}, internal vLLM request ID: {request_id}")
  
          request_metadata = RequestResponseMetadata(request_id=request_id)
          if raw_request:

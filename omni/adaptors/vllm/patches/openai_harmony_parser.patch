@@ -397,7 +397,7 @@ index 7743ae47f..fab1b1005 100644
      parallel_tool_calls: Optional[bool] = False
      user: Optional[str] = None
 diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
-index 03ec17201..6110e743a 100755
+index 18f0103d6..7eb0fdaf2 100755
 --- a/vllm/entrypoints/openai/serving_chat.py
 +++ b/vllm/entrypoints/openai/serving_chat.py
 @@ -5,13 +5,14 @@ import json
@@ -575,31 +575,10 @@ index 03ec17201..6110e743a 100755
  
                      if not delta_text and not output.token_ids and \
                          not previous_num_tokens[i]:
-@@ -679,8 +737,78 @@ class OpenAIServingChat(OpenAIServing):
+@@ -679,8 +737,57 @@ class OpenAIServingChat(OpenAIServing):
                          current_token_ids = previous_token_ids + list(
                              output.token_ids)
  
-+                    if not delta_text and not output.token_ids and \
-+                        not previous_num_tokens[i]:
-+                        # Chunked prefill case, don't return empty chunks
-+                        continue
-+
-+                    delta_message: Optional[DeltaMessage]
-+
-+                    # just update previous_texts and previous_token_ids
-+                    if tool_choice_auto or self.reasoning_parser:
-+                        assert previous_texts is not None
-+                        assert all_previous_token_ids is not None
-+                        previous_text = previous_texts[i]
-+                        previous_token_ids = all_previous_token_ids[i]
-+                        current_text = previous_text + delta_text
-+                        # avoid the None + list error.
-+                        if previous_token_ids:
-+                            current_token_ids = previous_token_ids + as_list(
-+                                output.token_ids)
-+                        else:
-+                            current_token_ids = as_list(output.token_ids)
-+
 +                    if self.use_harmony:
 +                        if cur_channel == "final":
 +                            delta_message = DeltaMessage(content=delta_text)
@@ -655,7 +634,7 @@ index 03ec17201..6110e743a 100755
                          if (enable_thinking
                                  and not reasoning_parser.is_reasoning_end(
                                      previous_token_ids)):
-@@ -741,7 +869,7 @@ class OpenAIServingChat(OpenAIServing):
+@@ -741,7 +848,7 @@ class OpenAIServingChat(OpenAIServing):
                              delta_message = DeltaMessage(tool_calls=[
                                  delta_tool_call,
                              ])
@@ -664,7 +643,7 @@ index 03ec17201..6110e743a 100755
                      elif request.tool_choice == "required":
                          assert previous_texts is not None
                          previous_text = previous_texts[i]
-@@ -816,6 +944,8 @@ class OpenAIServingChat(OpenAIServing):
+@@ -816,6 +923,8 @@ class OpenAIServingChat(OpenAIServing):
                                      current_token_ids=current_token_ids,
                                      delta_token_ids=delta_token_ids,
                                      request=request))
@@ -673,7 +652,7 @@ index 03ec17201..6110e743a 100755
                      # when only tool calls
                      elif tool_choice_auto:
                          assert tool_parser is not None
-@@ -828,6 +958,8 @@ class OpenAIServingChat(OpenAIServing):
+@@ -828,6 +937,8 @@ class OpenAIServingChat(OpenAIServing):
                                  current_token_ids=current_token_ids,
                                  delta_token_ids=output.token_ids,
                                  request=request))
@@ -682,7 +661,7 @@ index 03ec17201..6110e743a 100755
                      # when only reasoning
                      elif enable_thinking:
                          delta_message = (reasoning_parser.
-@@ -872,6 +1004,8 @@ class OpenAIServingChat(OpenAIServing):
+@@ -872,6 +983,8 @@ class OpenAIServingChat(OpenAIServing):
                                          current_token_ids=[],
                                          delta_token_ids=[],
                                          request=request))
@@ -691,7 +670,7 @@ index 03ec17201..6110e743a 100755
  
                              if tool_parser:
                                  auto_tools_called = len(tool_parser.prev_tool_call_arr) > 0
-@@ -919,12 +1053,18 @@ class OpenAIServingChat(OpenAIServing):
+@@ -919,12 +1032,18 @@ class OpenAIServingChat(OpenAIServing):
                              delta_message = DeltaMessage(content="")
  
                          # Send the finish response for each request.n only once
@@ -712,7 +691,7 @@ index 03ec17201..6110e743a 100755
                              stop_reason=output.stop_reason)
  
                          finish_reason_sent[i] = True
-@@ -1053,6 +1193,7 @@ class OpenAIServingChat(OpenAIServing):
+@@ -1053,6 +1172,7 @@ class OpenAIServingChat(OpenAIServing):
                      status_code=HTTPStatus.TOO_MANY_REQUESTS)
              token_ids = output.token_ids
              out_logprobs = output.logprobs
@@ -720,7 +699,7 @@ index 03ec17201..6110e743a 100755
  
              if request.logprobs and request.top_logprobs is not None:
                  assert out_logprobs is not None, "Did not output logprobs"
-@@ -1065,7 +1206,46 @@ class OpenAIServingChat(OpenAIServing):
+@@ -1065,7 +1185,46 @@ class OpenAIServingChat(OpenAIServing):
                  )
              else:
                  logprobs = None
@@ -768,7 +747,7 @@ index 03ec17201..6110e743a 100755
  
              enable_thinking = self.should_enable_thinking(request)
              if enable_thinking:
-@@ -1079,10 +1259,13 @@ class OpenAIServingChat(OpenAIServing):
+@@ -1079,10 +1238,13 @@ class OpenAIServingChat(OpenAIServing):
                  reasoning_content, content = (
                      reasoning_parser.extract_reasoning_content(
                          output.text, request=request))
@@ -782,16 +761,7 @@ index 03ec17201..6110e743a 100755
              # if auto tools are not enabled, and a named tool choice using
              #   outlines is not being used
              if (not self.enable_auto_tools or not self.tool_parser) and \
-@@ -1160,7 +1343,7 @@ class OpenAIServingChat(OpenAIServing):
-                     return self.create_error_response(str(e))
- 
-                 tool_call_info = tool_parser.extract_tool_calls(
--                    content if content is not None else "", request=request)
-+                    content if content is not None else "", request=request, token_ids=token_ids)
-                 # In the OpenAI API the finish_reason is "tools_called"
-                 # if the tool choice is auto and the model produced a tool
-                 # call. The same is not true for named function calls
-@@ -1431,6 +1614,36 @@ class OpenAIServingChat(OpenAIServing):
+@@ -1431,6 +1593,36 @@ class OpenAIServingChat(OpenAIServing):
  
          return enable_thinking
  

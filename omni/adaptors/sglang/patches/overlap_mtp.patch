@@ -101,7 +101,7 @@ index 05eb2f74a..5af463dd9 100644
  
  @triton.jit
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 56ac4d1a1..161cd11b9 100644
+index 56ac4d1a1..c933807ae 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -376,9 +376,13 @@ class Scheduler(
@@ -150,7 +150,7 @@ index 56ac4d1a1..161cd11b9 100644
 +                    if batch.forward_mode.is_decode_or_idle():
 +                        model_worker_batch = self.tp_worker.draft_worker.prepare_for_decode_target(batch)
 +                    else:
-+                        model_worker_batch = batch
++                        model_worker_batch = batch.get_model_worker_batch()
 +
 +                    logits_output, next_token_ids, bid, num_accepted_tokens, can_run_cuda_graph = \
 +                        self.tp_worker.forward_batch_generation(model_worker_batch)
@@ -474,7 +474,7 @@ index 14e0324ca..9da62381b 100644
      def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
          success, message = self.worker.update_weights_from_disk(recv_req)
 diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
-index ddaf1bf1d..d6df4161a 100644
+index ddaf1bf1d..2b06ef88c 100644
 --- a/python/sglang/srt/mem_cache/allocator.py
 +++ b/python/sglang/srt/mem_cache/allocator.py
 @@ -21,6 +21,7 @@ Page-aligned memory pool.
@@ -485,6 +485,15 @@ index ddaf1bf1d..d6df4161a 100644
  from typing import TYPE_CHECKING
  
  import torch
+@@ -547,7 +548,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+ 
+         if self.is_not_in_free_group:
+             free_page_indices = torch.unique(free_index // self.page_size)
+-            self.release_pages = torch.cat((free_page_indices, self.release_pages))
++            self.release_pages = torch.unique(torch.cat((free_page_indices, self.release_pages)))
+         else:
+             self.free_group.append(free_index)
+ 
 @@ -570,61 +571,27 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
          return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
  
@@ -743,6 +752,19 @@ index 6bc85cf4b..b7a30301f 100644
              if self.enable_mixed_chunk:
                  self.enable_mixed_chunk = False
                  logger.warning(
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 972904863..95468ee09 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -91,7 +91,7 @@ class EagleDraftInput:
+         assert len(self.verified_id) == len(batch.seq_lens)
+ 
+         pt = 0
+-        for i, extend_len in enumerate(batch.extend_lens):
++        for i, extend_len in enumerate(batch.extend_lens if isinstance(batch, ScheduleBatch) else batch.extend_seq_lens):
+             input_ids = batch.input_ids[pt : pt + extend_len]
+             batch.input_ids[pt : pt + extend_len] = torch.cat(
+                 (input_ids[1:], self.verified_id[i].reshape(1))
 diff --git a/python/sglang/srt/speculative/eagle_worker.py b/python/sglang/srt/speculative/eagle_worker.py
 index 9e4cf2dc2..bfe8d6f9f 100644
 --- a/python/sglang/srt/speculative/eagle_worker.py
@@ -776,7 +798,7 @@ index 9e4cf2dc2..bfe8d6f9f 100644
          return (
              logits_output,
 diff --git a/python/sglang/srt/speculative/mtp_worker.py b/python/sglang/srt/speculative/mtp_worker.py
-index 9228c0f77..e583a71d5 100644
+index 9228c0f77..88984a541 100644
 --- a/python/sglang/srt/speculative/mtp_worker.py
 +++ b/python/sglang/srt/speculative/mtp_worker.py
 @@ -1,8 +1,9 @@
@@ -945,7 +967,9 @@ index 9228c0f77..e583a71d5 100644
 -                if not batch.forward_mode.is_idle()
 -                else ForwardMode.IDLE
 -            )
--
++            self.prepare_sampling_info(model_worker_batch.sampling_info)
++            num_reqs = model_worker_batch.seq_lens.size(0) // (self.speculative_num_steps + 1)
+ 
 -            # from prepare_for_verify
 -            seq_lens = batch.seq_lens.repeat_interleave(self.speculative_num_steps+1, dim=0)
 -            seq_lens[1::2] += 1
@@ -975,9 +999,7 @@ index 9228c0f77..e583a71d5 100644
 -                            (req_pool_indices, locs), batch.out_cache_loc.to(torch.int32)
 -                )
 -            model_worker_batch = batch.get_model_worker_batch()
-+            self.prepare_sampling_info(model_worker_batch.sampling_info)
-+            num_reqs = model_worker_batch.seq_lens.size(0) // (self.speculative_num_steps + 1)
- 
+-
 -            num_reqs = len(batch.reqs)
 -
 -            positions = seq_lens - 1
@@ -1064,7 +1086,7 @@ index 9228c0f77..e583a71d5 100644
  
              # if not process, EagleDraftInput merge batch will error
              forward_batch.spec_info.topk_p = torch.ones_like(forward_batch.spec_info.topk_index, device=self.device, dtype=self.model_config.dtype)
-@@ -232,7 +285,7 @@ class MTPWorker(EAGLEWorker):
+@@ -232,10 +285,78 @@ class MTPWorker(EAGLEWorker):
                  logits_output,
                  verified_id,
                  model_worker_batch.bid,
@@ -1073,7 +1095,78 @@ index 9228c0f77..e583a71d5 100644
                  can_run_cuda_graph,
              )
  
-@@ -258,78 +311,46 @@ class MTPWorker(EAGLEWorker):
++    def forward_target_extend(
++        self, batch: ModelWorkerBatch,
++        launch_done: Optional[threading.Event] = None,
++    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
++        """Run the target extend.
++
++        Args:
++            batch: The batch to run. States could be modified.
++
++        Returns:
++            logits_output: The output of logits. It will contain the full hidden states.
++            next_token_ids: Next token ids generated.
++            bid: The model batch ID. Used for overlap schedule.
++        """
++        # Forward with the target model and get hidden states.
++        # We need the full hidden states to prefill the KV cache of the draft model.
++        model_worker_batch = batch
++        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
++        logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
++            model_worker_batch,
++            launch_done
++        )
++        return (
++            logits_output,
++            next_token_ids,
++            model_worker_batch.bid,
++            model_worker_batch.seq_lens_cpu,
++        )
++
++    def forward_draft_extend(
++        self,
++        batch: ModelWorkerBatch,
++        hidden_states: torch.Tensor,
++        next_token_ids: torch.Tensor,
++        seq_lens_cpu: Optional[torch.Tensor],
++    ):
++        """Run draft model extend. This API modifies the states of the batch.
++
++        Args:
++            batch: The batch to run.
++            hidden_states: Hidden states from the target model forward
++            next_token_ids: Next token ids generated from the target forward.
++        """
++        batch.spec_info = EagleDraftInput(
++            hidden_states=hidden_states,
++            verified_id=next_token_ids,
++            num_tokens_per_batch=1,
++            num_tokens_for_logprob_per_batch=1,
++        )
++        batch.return_hidden_states = False
++        batch.spec_info.prepare_for_extend(batch)
++        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
++
++        batch.seq_lens_cpu = (
++                seq_lens_cpu
++                if seq_lens_cpu is not None
++                else batch.seq_lens.cpu()
++            )
++        forward_batch = ForwardBatch.init_new(
++            batch, self.draft_model_runner
++        )
++        forward_batch.return_logprob = False
++        logits_output, _ = self.draft_model_runner.forward(forward_batch)
++        self._detect_nan_if_needed(logits_output)
++        assert isinstance(forward_batch.spec_info, EagleDraftInput)
++        assert forward_batch.spec_info is batch.spec_info
++        self.capture_for_decode(logits_output, forward_batch.spec_info)
++
+     def prepare_sampling_info(self, sampling_info):
+ 
+         self.raw_temperatures = sampling_info.temperatures
+@@ -258,78 +379,46 @@ class MTPWorker(EAGLEWorker):
              sampling_info.min_ps = self.raw_min_ps
  
      def _target_preprocess_decode(self, batch: ScheduleBatch):
@@ -1176,7 +1269,7 @@ index 9228c0f77..e583a71d5 100644
              accepted_num = torch.zeros(num_reqs, device=input_ids.device, dtype=torch.int32)  # (b,)
              last_accepted_index = torch.arange(num_reqs, device=input_ids.device, dtype=torch.int32) * num_sampling_tokens_per_req + accepted_num
              output_token_ids = forward_token_ids[::num_sampling_tokens_per_req]
-@@ -351,9 +372,4 @@ class MTPWorker(EAGLEWorker):
+@@ -351,9 +440,4 @@ class MTPWorker(EAGLEWorker):
              bouns_mask = offset[None, :] <= accepted_num[:, None] - 1
              bouns_ids = torch.where(bouns_mask, forward_token_ids.view(num_reqs, -1), self.minus_one)
  

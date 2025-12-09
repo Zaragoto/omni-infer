@@ -29,6 +29,7 @@ import sys
 import socket
 import json
 import shutil
+from process_logging_config import set_env_logger_file
 
 # Get the terminal width
 terminal_width = shutil.get_terminal_size().columns
@@ -68,11 +69,13 @@ def use_vllm_logging_config_path():
     return int(os.getenv("VLLM_CONFIGURE_LOGGING", "1")) and config_path and os.path.exists(config_path)
 
 def replace_logger_file(config_json, logger_file_path):
+    set_file_handler = False
     for handler_name, handler_config in config_json.get("handlers", {}).items():
         if "filename" in handler_config:
-            handler_config["filename"] = logger_file_path
-    return config_json
-
+            if config_json.get("omni_logging_format", False):
+                handler_config["filename"] = logger_file_path
+            set_file_handler = True
+    return config_json, set_file_handler
 
 def start_single_node_api_servers(
     num_servers,
@@ -198,26 +201,38 @@ def start_single_node_api_servers(
         if use_vllm_logging_config_path():
             with open(os.getenv("VLLM_LOGGING_CONFIG_PATH"), "r") as f:
                 config_json = json.load(f)
-            config_json = replace_logger_file(config_json, logger_path)
+            config_json, set_file_handler = replace_logger_file(config_json, logger_path)
+            if config_json.get("process_logging_config", False):
+                config_json = set_env_logger_file(config_json)
             print(f"Use VLLM_LOGGING_CONFIG: {config_json}")
 
             tmp_file_name = tempfile.mkstemp()[1]
             tmp_file = open(tmp_file_name, "w")
             json.dump(config_json, tmp_file)
             tmp_file.close()
-
+            
             env["VLLM_LOGGING_CONFIG_PATH"] = tmp_file_name
-            if print_screen:
-                stdout = sys.stdout
-                stderr = sys.stdout
+            
+            if set_file_handler:
+                if print_screen:
+                    stdout = sys.stdout
+                    stderr = sys.stdout
+                else:
+                    stdout = subprocess.DEVNULL
+                    stderr = subprocess.DEVNULL
+                # occupy space
+                log_file = tmp_file
             else:
-                stdout = subprocess.DEVNULL
-                stderr = subprocess.DEVNULL
-            # occupy space
-            log_file = tmp_file
+                if print_screen:
+                    print(f"print_screen only takes effect when the VLLM_LOGGING_CONFIG_PATH is active and FileHandler is setted")
+                # Open a single log file for combined stdout and stderr
+                log_file = open(logger_path, "w")
+
+                stdout = log_file
+                stderr = subprocess.STDOUT  # Redirect stderr to stdout (same log file)
         else:
             if print_screen:
-                print(f"print_screen only takes effect when the VLLM_LOGGING_CONFIG_PATH is active")
+                print(f"print_screen only takes effect when the VLLM_LOGGING_CONFIG_PATH is active and FileHandler is setted")
             # Open a single log file for combined stdout and stderr
             log_file = open(logger_path, "w")
 

@@ -32,7 +32,7 @@ from vllm.distributed.parallel_state import (
     get_dp_group,
     get_tp_group,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_world_size
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -49,10 +49,12 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from omni.layers.attention.backend.attention import AscendAttentionState
 from omni.layers.layernorm import RMSNorm
 from omni.layers.moe.fused_moe.layer import FusedMoE
+from omni.layers.linear import ColumnParallelFlashCommLinear
 from omni.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding
 )
+from omni.adaptors.vllm.distributed import get_eh_proj_tp_group
 
 from .pangu_moe_v2 import PanguProMoEDecoderLayer
 
@@ -81,6 +83,7 @@ class PanguProMoEMultiTokenPredictorLayer(PanguProMoEDecoderLayer):
     def __init__(
         self,
         config: PretrainedConfig,
+        vllm_config: VllmConfig,
         prefix: str,
         model_config: ModelConfig,
         cache_config: Optional[CacheConfig] = None,
@@ -95,16 +98,24 @@ class PanguProMoEMultiTokenPredictorLayer(PanguProMoEDecoderLayer):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(
-            config.hidden_size * 2,
-            config.hidden_size,
-            bias=False)
+        self.eh_tp_size = get_eh_proj_tp_group().world_size
+        self.eh_tp_rank = get_eh_proj_tp_group().rank_in_group
+        self.eh_proj = ColumnParallelFlashCommLinear(
+            input_size=2 * config.hidden_size,
+            output_size=config.hidden_size,
+            bias=False,
+            tp_size=self.eh_tp_size,
+            tp_rank=self.eh_tp_rank,
+            quant_config=None,
+            prefix=f"{prefix}.eh_proj",
+        )
         self.shared_head = PanguProMoEShareHead(
             config=config,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "shared_head"))
         self.mtp_block = PanguProMoEDecoderLayer(
             config,
+            vllm_config,
             cache_config,
             quant_config,
             prefix)
@@ -131,7 +142,13 @@ class PanguProMoEMultiTokenPredictorLayer(PanguProMoEDecoderLayer):
 
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
-        hidden_states = self.eh_proj(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
+        cat_hidden_states = torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+
+        if self.eh_tp_size > 1:
+            cat_hidden_states = get_eh_proj_tp_group().all_gather(cat_hidden_states, dim=0)
+        hidden_states, _ = self.eh_proj.forward(cat_hidden_states)
+        if self.eh_tp_size > 1:
+            hidden_states = get_eh_proj_tp_group().all_to_all(hidden_states)
 
         hidden_states, residual = self.mtp_block(
             positions=positions,
@@ -180,6 +197,7 @@ class PanguProMoeMultiTokenPredictor(DeepSeekMultiTokenPredictor):
             str(i + self.mtp_start_layer_idx): 
             PanguProMoEMultiTokenPredictorLayer(
                 config,
+                vllm_config,
                 f"{prefix}.layers.{i + self.mtp_start_layer_idx}",
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,

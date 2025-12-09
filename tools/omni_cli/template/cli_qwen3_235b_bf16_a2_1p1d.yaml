@@ -142,7 +142,6 @@ all:
             VLLM_LOGGING_LEVEL: INFO
             VLLM_USE_V1: 1
             VLLM_WORKER_MULTIPROC_METHOD: fork
-            TORCHAIR_CACHE_HOME: /tmp/torchair
           host_ip: 127.0.0.3
           master_node: d0
         d1:
@@ -267,7 +266,6 @@ all:
             VLLM_LOGGING_LEVEL: INFO
             VLLM_USE_V1: 1
             VLLM_WORKER_MULTIPROC_METHOD: fork
-            TORCHAIR_CACHE_HOME: /tmp/torchair
           host_ip: 127.0.0.3
           master_node: d0
     P:

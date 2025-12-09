@@ -393,19 +393,36 @@ ansible-playbook -i omni_infer_inventory_used_for_2P1D.yml omni_infer_server_tem
 profiling采集代码位于`omni\adaptors\vllm\worker\npu_worker.py`文件。  
 既可以采集prefill，又可以采集decode的profiling。可以自动停止，也可以curl端口提前停止。  
 主要配置项为以下环境变量：  
-1. `VLLM_TORCH_PROFILER_DIR`：在pd_run.sh设置，默认设置为/tmp/profiling，表示profiling文件存放位置，若设置了可以通过post /start_profile接口开启采集profiling，并且通过post /stop_profile接口停止。没设置则不开启。  
+1. `VLLM_TORCH_PROFILER_DIR`：在pd_run.sh或anisble或cli设置，表示profiling文件存放位置，设置后可以通过post /start_profile接口开启采集profiling，并且通过post /stop_profile接口停止。没设置则不开启。  
 与官方接口保持一致
 2. `PROFILER_STOP_STEP`：表示采集profiling的步数，在启动后需要采集多少就设置为多少，默认为5。 到达指定步数后自动停止。 
-
+3. `PROFILER_TOKEN_THRESHOLD`：新逻辑（手动启动）下请勿设置，设置后默认开启旧逻辑，表示step调度的token数，是采集profiling的入口条件，可以根据这个值区分采集的阶段，默认值为1。 
 用法：
 ```bash
-#首先在pd_run设置保存地址，默认为/tmp/profiling
+#在pd_run或ansible或cli设置环境变量
 export VLLM_TORCH_PROFILER_DIR=./profiling
 export PROFILER_STOP_STEP=5
+export PROFILER_TOKEN_THRESHOLD=1
+#新逻辑下一键请求脚本,用于批量启动停止profile
+#tools/scrips/run_profile.py
+#同时对 P 和 D 执行 start:
+python run_profile.py -i ansible_inventory.yml -g P D -a start
+#只对 D 执行 stop:
+python run_profile.py -i ansible_inventory.yml -g D -a stop
 ```
-直接发起请求控制开启和关闭,与vllm官方接口一致
+## 参数说明
+
+| 参数 | 必填 | 说明 | 示例 |
+|------|------|------|------|
+| `-i, --inventory` | 否 | inventory 文件路径，默认 `ansible_inventory.yml` | `-i deploy/ansible/inventory.yml` |
+| `-g, --groups` | 否 | 目标组列表，只能是 `P`、`D`，默认同时两组 | `-g P` |
+| `-a, --actions` | 否 | 动作序列，取值 `start` 或 `stop`，默认`start` | `-a start stop` |
+| `--scheme` | 否 | 协议，`http` 或 `https`，默认 `http` | `--scheme https` |
+
+新逻辑下可以直接发起请求控制开启和关闭,与vllm官方接口一致
 ```bash
-#暂时不支持curl proxy,直接 curl 想要开启profile的服务，端口为配置文件中api port，可以在日志中查看实际端口
+#不支持curl proxy,可以直接单独 curl 想要开启profile的服务，端口为ansible配置文件中各节点api port，也可以在日志中查看实际端口
 curl  -X POST ip:port/start_profile
 curl  -X POST ip:port/stop_profile
 ```
+如果需要使用旧逻辑，允许自动启动profile，请设置环境变量PROFILER_TOKEN_THRESHOLD

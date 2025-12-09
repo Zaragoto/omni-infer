@@ -201,11 +201,11 @@ class OmniPlanner(metaclass=OmniPlannerMeta):
                   f"num_devices_per_host ({self.num_devices_per_host})")
 
     def placement_pause(self) -> None:
-        if self.placement_manager is not None:
+        if self.enable_dynamic or self.enable_dump:
             self.placement_manager.placement_pause()
 
     def placement_resume(self) -> None:
-        if self.placement_manager is not None:
+        if self.enable_dynamic or self.enable_dump:
             self.placement_manager.placement_resume()
 
     def _init_placement_manager(self) -> None:

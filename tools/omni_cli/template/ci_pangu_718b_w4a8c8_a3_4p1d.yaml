@@ -32,6 +32,7 @@ all:
                 level: 1
                 use_ge_graph_cached: true
               enable_omni_attn: true
+              enable_omni_placement: true
               omni_placement_config:
                 pattern_path: ''
                 max_moe_layer_num: 58
@@ -68,6 +69,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu_a3_4p1d_d0
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9000
             VLLM_LLMDATADIST_ZMQ_PORT: 5573
             ASCEND_AICPU_PATH: /usr/local/Ascend/latest
@@ -111,7 +113,7 @@ all:
             GLOBAL_DECODE_SERVER_IP_LIST: ${SERVER_IP_LIST}
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
-            HCCL_BUFFSIZE: 800
+            HCCL_BUFFSIZE: 1200
             HCCL_CONNECT_TIMEOUT: 1800
             HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
@@ -133,7 +135,7 @@ all:
             PREFILL_POD_NUM: 4
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
             RANKTABLE_SAVE_PATH: /tmp/ranktable_save_path
-            RANK_TABLE_FILE_PATH: $(ls /tmp/ranktable_save_path/global/collect_files_d/local_*merge.json)
+            RANK_TABLE_FILE_PATH: $(ls ${RANKTABLE_SAVE_PATH}/global/collect_files_d/local_*merge.json)
             ROLE: decode
             SERVER_IP_LIST: 127.0.0.2,127.0.0.3
             SERVER_OFFSET: 0
@@ -164,6 +166,7 @@ all:
                 level: 1
                 use_ge_graph_cached: true
               enable_omni_attn: true
+              enable_omni_placement: true
               omni_placement_config:
                 pattern_path: ''
                 max_moe_layer_num: 58
@@ -200,6 +203,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu_a3_4p1d_d1
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9000
             VLLM_LLMDATADIST_ZMQ_PORT: 5574
             ASCEND_AICPU_PATH: /usr/local/Ascend/latest
@@ -243,7 +247,7 @@ all:
             GLOBAL_DECODE_SERVER_IP_LIST: ${SERVER_IP_LIST}
             GLOBAL_RANK_TABLE_FILE_PATH: ${RANKTABLE_SAVE_PATH}/global/global_ranktable_merge.json
             GLOO_SOCKET_IFNAME: enp23s0f3
-            HCCL_BUFFSIZE: 800
+            HCCL_BUFFSIZE: 1200
             HCCL_CONNECT_TIMEOUT: 1800
             HCCL_EXEC_TIMEOUT: 1800
             HCCL_INTRA_PCIE_ENABLE: 0
@@ -265,7 +269,7 @@ all:
             PREFILL_POD_NUM: 4
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
             RANKTABLE_SAVE_PATH: /tmp/ranktable_save_path
-            RANK_TABLE_FILE_PATH: $(ls /tmp/ranktable_save_path/global/collect_files_d/local_*merge.json)
+            RANK_TABLE_FILE_PATH: $(ls ${RANKTABLE_SAVE_PATH}/global/collect_files_d/local_*merge.json)
             ROLE: decode
             SERVER_IP_LIST: 127.0.0.2,127.0.0.3
             SERVER_OFFSET: 16
@@ -295,8 +299,9 @@ all:
           args:
             additional-config:
               enable_omni_attn: true
+              enable_omni_placement: true
               omni_placement_config:
-                pattern_path: "../../omni/accelerators/placement/patterns/A2_900_placement_pattern_20250904_2k2k_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
+                pattern_path: "../../omni/accelerators/placement/patterns/placement_pattern_20251128_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
                 max_moe_layer_num: 58
                 enable_dynamic: False
                 max_redundant_per_expert: 1
@@ -332,6 +337,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7
           container_name: pangu_a3_4p1d_p0
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             ASCEND_GLOBAL_LOG_LEVEL: 3
             VLLM_LLMDATADIST_ZMQ_PORT: 5569
             API_PORT: 9000
@@ -429,8 +435,9 @@ all:
           args:
             additional-config:
               enable_omni_attn: true
+              enable_omni_placement: true
               omni_placement_config:
-                pattern_path: "../../omni/accelerators/placement/patterns/A2_900_placement_pattern_20250904_2k2k_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
+                pattern_path: "../../omni/accelerators/placement/patterns/placement_pattern_20251128_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
                 max_moe_layer_num: 58
                 enable_dynamic: False
                 max_redundant_per_expert: 1
@@ -466,6 +473,7 @@ all:
           ascend_rt_visible_devices: 8,9,10,11,12,13,14,15
           container_name: pangu_a3_4p1d_p1
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             ASCEND_GLOBAL_LOG_LEVEL: 3
             VLLM_LLMDATADIST_ZMQ_PORT: 5570
             API_PORT: 9001
@@ -563,8 +571,9 @@ all:
           args:
             additional-config:
               enable_omni_attn: true
+              enable_omni_placement: true
               omni_placement_config:
-                pattern_path: "../../omni/accelerators/placement/patterns/A2_900_placement_pattern_20250904_2k2k_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
+                pattern_path: "../../omni/accelerators/placement/patterns/placement_pattern_20251128_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
                 max_moe_layer_num: 58
                 enable_dynamic: False
                 max_redundant_per_expert: 1
@@ -600,6 +609,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7
           container_name: pangu_a3_4p1d_p2
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             ASCEND_GLOBAL_LOG_LEVEL: 3
             VLLM_LLMDATADIST_ZMQ_PORT: 5571
             API_PORT: 9002
@@ -697,8 +707,9 @@ all:
           args:
             additional-config:
               enable_omni_attn: true
+              enable_omni_placement: true
               omni_placement_config:
-                pattern_path: "../../omni/accelerators/placement/patterns/A2_900_placement_pattern_20250904_2k2k_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
+                pattern_path: "../../omni/accelerators/placement/patterns/placement_pattern_20251128_58_rearrange_layers_58_layers_8_ranks_prefill.npy"
                 max_moe_layer_num: 58
                 enable_dynamic: False
                 max_redundant_per_expert: 1
@@ -734,6 +745,7 @@ all:
           ascend_rt_visible_devices: 8,9,10,11,12,13,14,15
           container_name: pangu_a3_4p1d_p3
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             ASCEND_GLOBAL_LOG_LEVEL: 3
             VLLM_LLMDATADIST_ZMQ_PORT: 5572
             API_PORT: 9003

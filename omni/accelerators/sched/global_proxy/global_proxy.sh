@@ -117,7 +117,13 @@ events {
 }
 
 http {
+EOF
+    if [ "$engine_type" = "vllm" ]; then
+        cat >> "$nginx_conf_file" <<EOF
     $(gen_access_log "$access_log_file")
+EOF
+    fi
+    cat <<EOF >> $nginx_conf_file
     include       mime.types;
     default_type  application/octet-stream;
 

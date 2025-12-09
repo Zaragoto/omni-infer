@@ -47,9 +47,6 @@ echo "PYTHON_VERSION is $PYTHON_VERSION"
 NGINX_SBIN_PATH="${NGINX_SBIN_PATH:-/usr/sbin}"
 echo "NGINX_SBIN_PATH is $NGINX_SBIN_PATH"
 
-
-yum install -y pcre gcc gcc-c++ make zlib zlib-devel pcre pcre-devel openssl-devel zeromq zeromq-devel boost-devel
-
 [ -d "msgpack-c-${MSGPACK_VERSION}" ] && rm -rf "msgpack-c-${MSGPACK_VERSION}"
 [ -d "Python-${PYTHON_VERSION}" ] && rm -rf "Python-${PYTHON_VERSION}"
 
@@ -60,7 +57,8 @@ fi
 
 if [ "$SKIP_EXTRAS" = false ]; then
     echo ">>> Building msgpack-c and Python (default)"
-
+    
+    yum install -y pcre gcc gcc-c++ make zlib zlib-devel pcre pcre-devel openssl-devel zeromq zeromq-devel boost-devel
     [ ! -f msgpack-c-${MSGPACK_VERSION}.tar.gz ] && wget --no-check-certificate https://github.com/msgpack/msgpack-c/releases/download/c-${MSGPACK_VERSION}/msgpack-c-${MSGPACK_VERSION}.tar.gz
     if [ ! -d msgpack-c-${MSGPACK_VERSION} ]; then
         tar -zxf msgpack-c-${MSGPACK_VERSION}.tar.gz

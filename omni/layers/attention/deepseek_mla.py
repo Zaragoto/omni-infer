@@ -219,7 +219,7 @@ class Indexer(nn.Module):
             q_rope_mini, q_nope_mini = torch.split(q_mini, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)  # [b,s,64,64+64]
 
             q_rope_mini = q_rope_mini.unsqueeze(2)
-            q_rope_mini = torch_npu.npu_interleave_rope(q_rope_mini, cos_q, sin_q)
+            q_rope_mini = torch_npu.npu_rotary_mul(q_rope_mini, cos_q, sin_q)
             q_rope_mini = q_rope_mini.squeeze(2)
 
             if model_extra_config.parall_config.attn_sp_size > 1:
@@ -238,7 +238,7 @@ class Indexer(nn.Module):
         k_mini_rope, k_mini_nope = torch.split(k_mini, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)  # [b,s,64+64]
 
         k_mini_rope = k_mini_rope.unsqueeze(2)
-        k_mini_rope = torch_npu.npu_interleave_rope(k_mini_rope, cos, sin)
+        k_mini_rope = torch_npu.npu_rotary_mul(k_mini_rope, cos, sin)
         k_mini_rope = k_mini_rope.squeeze(2)
 
         k_mini = torch.cat([k_mini_rope, k_mini_nope], dim=-1)  # [b*s,128]
@@ -462,7 +462,9 @@ class DeepseekMLA(nn.Module):
                                                              bias=False,
                                                              quant_config=quant_config,
                                                              prefix=f"{prefix}.o_proj")
-
+        self.kv_a_proj_event = torch_npu.npu.Event()
+        self.q_norm_event = torch_npu.npu.Event()
+        self.kv_all_gather_event = torch_npu.npu.Event()
         if rope_scaling:
             rope_scaling["rope_type"] = 'deepseek_yarn'
 
@@ -555,6 +557,8 @@ class DeepseekMLA(nn.Module):
         if model_extra_config.operator_opt_config.c8_calib_path is not None:
             os.makedirs(model_extra_config.operator_opt_config.c8_calib_path, exist_ok=True)
 
+        self.stream1 = torch.npu.Stream() if model_extra_config.operator_opt_config.enable_mla_prefill_multistream else None
+
     def mla_epilog(self,
         batch_size: int,
         attn_output: torch.Tensor = None,
@@ -641,7 +645,7 @@ class DeepseekMLA(nn.Module):
         attn_metadata: AttentionMetadata,
         comm_group: Optional[GroupCoordinator] = None,
     ) -> torch.Tensor:
-        if not self.is_init:
+        if not self.is_init and self.enable_graph_mode:
             self.W_UK = torch.nn.Parameter(self.W_UK.contiguous(), requires_grad=False)
             self.W_UV = torch.nn.Parameter(self.W_UV.contiguous(), requires_grad=False)
             self.is_init = True
@@ -844,12 +848,16 @@ class DeepseekMLA(nn.Module):
                 q = self.q_a_layernorm(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
-                q = self.q_a_proj(hidden_states)[0]
                 latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-                # q = tensor_model_parallel_all_gather(q, dim=0)
+                self.kv_a_proj_event.record()
+                with torch.npu.stream(self.stream1):
+                    self.kv_a_proj_event.wait()
+                    q = self.q_a_proj(hidden_states)[0]
+                    q = self.q_a_layernorm(q)
+                    self.q_norm_event.record()
                 latent_cache = mla_tensor_model_parallel_all_gather(latent_cache, dim=0, comm_group=comm_group)
-
-                q = self.q_a_layernorm(q)
+                self.kv_all_gather_event.record()
+                self.q_norm_event.wait()
                 if self.quant_symbol:
                     q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
                     # Quantizing before all_gather can reduce communication overhead.
@@ -879,21 +887,23 @@ class DeepseekMLA(nn.Module):
             kv_cache = kv_cache.get("kv_cache")
         if kv_cache is not None and isinstance(kv_cache, Tuple) and kv_cache[0].numel() > 0:
             # raise RuntimeError(f"Should not come here.")
-            # k_pe:BNS,64 kv_a:BNS, 512, kv_states:bnsd, cos,sin:bnsd,kv cache:bsnd
-            _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
-                latent_cache.view(-1, 1, 1, 576), # bnsd
-                self.kv_a_layernorm.weight,
-                cos.view(-1, 1, 1, self.qk_rope_head_dim),
-                sin.view(-1, 1, 1, self.qk_rope_head_dim),
-                attn_metadata.slot_mapping,
-                kv_cache[1],
-                kv_cache[0],
-                k_rope_scale=None,
-                c_kv_scale=self.kv_scale_reci_tile,
-                k_rope_offset=None, c_kv_offset=None,
-                epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA_NZ",
-                is_output_kv=True) # adapter NZ
+            with torch.npu.stream(self.stream1):
+                self.kv_all_gather_event.wait()
+                # k_pe:BNS,64 kv_a:BNS, 512, kv_states:bnsd, cos,sin:bnsd,kv cache:bsnd
+                _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                    latent_cache.view(-1, 1, 1, 576), # bnsd
+                    self.kv_a_layernorm.weight,
+                    cos.view(-1, 1, 1, self.qk_rope_head_dim),
+                    sin.view(-1, 1, 1, self.qk_rope_head_dim),
+                    attn_metadata.slot_mapping,
+                    kv_cache[1],
+                    kv_cache[0],
+                    k_rope_scale=None,
+                    c_kv_scale=self.kv_scale_reci_tile,
+                    k_rope_offset=None, c_kv_offset=None,
+                    epsilon=self.kv_a_layernorm.variance_epsilon,
+                    cache_mode="PA_NZ",
+                    is_output_kv=True) # adapter NZ
 
             if model_extra_config.operator_opt_config.c8_calib_path is not None and get_world_group().rank_in_group == 0:
                 layer_idx = int(self.prefix.split(sep='.')[-2])
@@ -945,15 +955,16 @@ class DeepseekMLA(nn.Module):
             ):
                 if prefill_metadata.kv_index_list and kv_cache is not None and isinstance(kv_cache, Tuple) and\
                         kv_cache[0].numel() > 0 and not self.fa_quant:
-                    # raise RuntimeError(f"Should not come here.")
-                    # adapt nz
-                    block_num, block_size, head_size, _ = kv_cache[0].shape
-                    kv_cache_a = (kv_cache[0]
-                                .view(block_num, 1, self.kv_lora_rank // KVCACHE_NZ_DIM, block_size, KVCACHE_NZ_DIM))
-                    kv_cache_pe = (kv_cache[1]
-                                .view(block_num, 1, self.qk_rope_head_dim // KVCACHE_NZ_DIM, block_size, KVCACHE_NZ_DIM))
-                    kv_cache_a = kv_cache_a.transpose(1, 3)
-                    kv_cache_pe = kv_cache_pe.transpose(1, 3)
+                    with torch.npu.stream(self.stream1):
+                        # raise RuntimeError(f"Should not come here.")
+                        # adapt nz
+                        block_num, block_size, head_size, _ = kv_cache[0].shape
+                        kv_cache_a = (kv_cache[0]
+                                    .view(block_num, 1, self.kv_lora_rank // KVCACHE_NZ_DIM, block_size, KVCACHE_NZ_DIM))
+                        kv_cache_pe = (kv_cache[1]
+                                    .view(block_num, 1, self.qk_rope_head_dim // KVCACHE_NZ_DIM, block_size, KVCACHE_NZ_DIM))
+                        kv_cache_a = kv_cache_a.transpose(1, 3)
+                        kv_cache_pe = kv_cache_pe.transpose(1, 3)
                     # adapt end
                     kv_a = kv_cache_a.reshape(-1, kv_cache[0].shape[-1]) \
                         .index_select(0, prefill_metadata.kv_index_list[iter]).contiguous()
@@ -1008,10 +1019,12 @@ class DeepseekMLA(nn.Module):
         else:
             attn_output.fill_(0)
 
+        self.stream1 = None
+
         # if only set prefill_enable_mla_alltoall means prefill o_proj tp to dp
         # if also set o_proj_tp_size means prefill o_proj tp to dp + tp
         if model_extra_config.operator_opt_config.prefill_enable_mla_alltoall:
-            if attn_metadata is not None:
+            if attn_metadata is not None and get_tensor_model_parallel_world_size() != model_extra_config.parall_config.o_proj_tp_size:
                 if model_extra_config.parall_config.o_proj_tp_size > 1:
                     attn_output = attn_output.view(get_o_proj_dp_group().world_size, -1, self.num_local_heads, self.v_head_dim)
                 attn_output = attn_output.reshape(-1)
@@ -1187,7 +1200,6 @@ class DeepseekMLA(nn.Module):
                 cache_mode = (
                         "PA"
                         if model_extra_config.operator_opt_config.enable_dsa
-                        or model_extra_config.operator_opt_config.use_omni_cache
                         else "PA_NZ"
                     )
                 kv = kv.unsqueeze(1).unsqueeze(1)
@@ -1304,17 +1316,8 @@ class DeepseekMLA(nn.Module):
                 sparse_mode=3,
             )
         else:
-            if model_extra_config.operator_opt_config.use_omni_cache:
-                num_tokens = attn_metadata.decode.seq_lens.size(0)
-                q_nope = q_nope.view(num_tokens, 1, self.num_local_heads, 512)
-                q_pe = q_pe.view(num_tokens, 1, self.num_local_heads, 64)
-                k_nope = k_nope.view(-1, 128, 512)
-                k_rope = k_rope.view(-1, 128, 64)
-                input_layout_mla = "BSND"
-                actual_seq_lengths_mla = None
-            else:
-                input_layout_mla = input_layout
-                actual_seq_lengths_mla = self.actual_seq_lengths[bsz]
+            input_layout_mla = input_layout
+            actual_seq_lengths_mla = self.actual_seq_lengths[bsz]
             attn_output, _ = op_scope.npu_fused_infer_attention_score(
                 q_nope, k_nope, k_nope, query_rope=q_pe, key_rope=k_rope,
                 num_heads=self.num_local_heads,
@@ -1329,7 +1332,7 @@ class DeepseekMLA(nn.Module):
                 actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
             )
 
-        if model_extra_config.operator_opt_config.enable_dsa or model_extra_config.operator_opt_config.use_omni_cache:
+        if model_extra_config.operator_opt_config.enable_dsa:
             attn_output = attn_output.squeeze(1).transpose(0, 1)
         else:
             # Apply UV, (N, B, L) @ W_UV (N, L, V) -> (N, B, V)
@@ -1408,6 +1411,7 @@ class DeepseekMLA(nn.Module):
                     attn_metadata.slot_mapping,
                     kv_cache[1],
                     kv_cache[0],
+                    c_kv_scale=self.kv_scale_reci_tile,
                     epsilon=self.kv_a_layernorm.variance_epsilon,
                     cache_mode="PA_NZ",
                     is_output_kv=True)
@@ -1466,7 +1470,7 @@ class DeepseekMLA(nn.Module):
                 ):
                     prefill_q = q[computed_tokens:computed_tokens + actual_seq_qlen[-1]]
                     if prefill_metadata.kv_index_list and kv_cache is not None and isinstance(kv_cache, Tuple) and \
-                            kv_cache[0].numel() > 0:
+                            kv_cache[0].numel() > 0 and not self.fa_quant:
 
                         block_num, block_size, head_size, _ = kv_cache[0].shape
                         kv_cache_a = (kv_cache[0]

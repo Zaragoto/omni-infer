@@ -279,7 +279,10 @@ class ConfigUpdater:
         enable_omni_attn = check_omni_attn_cmd_arg(vllm_config.additional_config)
         kv_transfer_config = vllm_config.kv_transfer_config
         is_kv_consumer = kv_transfer_config is None or kv_transfer_config.kv_role == 'kv_consumer'
-        omni_attn_config = vllm_config.additional_config.get("omni_attn_config", None)
+        if hasattr(vllm_config, "additional_config") and vllm_config.additional_config:
+            omni_attn_config = vllm_config.additional_config.get("omni_attn_config", None)
+        else:
+            omni_attn_config = None
         enable_omni_cache = os.getenv("ENABLE_OMNI_CACHE", "0") == "1"
         apply_omni_attn_patch(
             enable_attn=enable_omni_attn,
@@ -342,15 +345,14 @@ class NPUPlatform(Platform):
 
     @staticmethod
     def _check_required_env_vars():
-        """Check if THINK_START_TOKEN_ID,THINK_END_TOKEN_ID,AFTER_THINK_TOKEN_IDS are set."""
+        """Check if THINK_START_TOKEN_ID,THINK_END_TOKEN_ID are set."""
         ENABLE_MAX_TOKENS_EXCLUDE_REASONING = (os.environ.get("ENABLE_MAX_TOKENS_EXCLUDE_REASONING","0") == "1")
         ENABLE_REASONING_MAX_TOKENS = (os.environ.get("ENABLE_REASONING_MAX_TOKENS","0") == "1")
         THINK_START_TOKEN_ID: int = int(os.environ.get("THINK_START_TOKEN_ID","0"))
         THINK_END_TOKEN_ID: int = int(os.environ.get("THINK_END_TOKEN_ID","0"))
-        AFTER_THINK_TOKEN_IDS: list[int] = list(map(int,os.environ.get("AFTER_THINK_TOKEN_IDS","0").split(",")))
         
-        if (ENABLE_MAX_TOKENS_EXCLUDE_REASONING or ENABLE_REASONING_MAX_TOKENS) and not (THINK_START_TOKEN_ID and THINK_END_TOKEN_ID and AFTER_THINK_TOKEN_IDS):
-            raise ValueError("Environment variable THINK_START_TOKEN_ID,THINK_END_TOKEN_ID,AFTER_THINK_TOKEN_IDS not set")
+        if (ENABLE_MAX_TOKENS_EXCLUDE_REASONING or ENABLE_REASONING_MAX_TOKENS) and not (THINK_START_TOKEN_ID and THINK_END_TOKEN_ID):
+            raise ValueError("Environment variable THINK_START_TOKEN_ID,THINK_END_TOKEN_ID not set")
 
     @classmethod
     def is_sleep_mode_available(cls) -> bool:

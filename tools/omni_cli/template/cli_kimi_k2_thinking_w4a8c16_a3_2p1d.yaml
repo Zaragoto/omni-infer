@@ -128,6 +128,7 @@ all:
             MASTER_PORT: 8000
             MODEL_LEN_MAX_DECODE: 65600
             MODEL_PATH: /data/models/Kimi-K2-Thinking-rotate-int4
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 2
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
@@ -258,6 +259,7 @@ all:
             MASTER_PORT: 8000
             MODEL_LEN_MAX_DECODE: 65600
             MODEL_PATH: /data/models/Kimi-K2-Thinking-rotate-int4
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 2
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
@@ -388,6 +390,7 @@ all:
             MASTER_PORT: 8000
             MODEL_LEN_MAX_PREFILL: 65600
             MODEL_PATH: /data/models/Kimi-K2-Thinking-rotate-int4
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 2
             PREFILL_SERVER_LIST: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
@@ -519,6 +522,7 @@ all:
             MASTER_PORT: 8000
             MODEL_LEN_MAX_PREFILL: 65600
             MODEL_PATH: /data/models/Kimi-K2-Thinking-rotate-int4
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             OMNI_USE_DSV3: 1
             PREFILL_POD_NUM: 2
             PREFILL_SERVER_LIST: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15

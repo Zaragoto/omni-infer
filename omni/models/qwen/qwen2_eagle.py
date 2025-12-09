@@ -120,6 +120,7 @@ class EagleQwen2Model(Qwen2Model):
         )
 
         self.aux_hidden_state_layers = tuple()
+        self.is_unquantized = quant_config is None
 
     def forward(
         self,

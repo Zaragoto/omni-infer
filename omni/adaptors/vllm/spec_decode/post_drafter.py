@@ -18,10 +18,11 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
 import torch
 import torch_npu
 import torch.nn as nn
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, TYPE_CHECKING
 
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -34,6 +35,8 @@ from omni.adaptors.vllm.forward_context import set_forward_context
 from omni.layers.sampler import random_choice
 from omni.layers.attention.backend.attention import AscendAttentionState
 from omni.models.config_loader.loader import model_extra_config
+if TYPE_CHECKING:
+    from omni.adaptors.vllm.worker.npu_model_runner import NPUModelRunner
 
 def mark_static_for_graph_default(
         input_ids,
@@ -53,16 +56,15 @@ class PostDrafter(EagleProposer):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        runner=None,
-    ):
+        runner: NPUModelRunner,
+    ) -> None:
         super().__init__(vllm_config, device, runner)
         self.drafter_list = []
         self.method = self.vllm_config.speculative_config.method
-        self.enable_adaptive = self.vllm_config.speculative_config.enable_adaptive
+        self.enable_adaptive = self.speculative_config.enable_adaptive
         self.mark_static = False
         self.rejection_sampler = runner.rejection_sampler
         self.use_rejection_sampler = runner.use_rejection_sampler
-        self.topk = runner.topk
 
         # eagle proposer set dtype as int32, while we need int64
         self.input_ids = torch.zeros(self.max_num_tokens,
@@ -71,8 +73,7 @@ class PostDrafter(EagleProposer):
         self.positions = None
         self.hidden_states = None
         self.arange = torch.arange(runner.decode_max_num_tokens, device=device)
-        self.dsa_stream = torch_npu.npu.Stream()
-        self.main_sampler = runner.rejection_sampler.main_sampler
+        self.main_sampler = runner.sampler
         # TODO check model type
         if self.method not in ('deepseek_mtp', 'eagle', 'eagle3', 'pangu_ultra_moe_mtp', 'qwen3_mtp', 'pangu_moe_v2_mtp'):
             raise ValueError(f"Speculative method should be one of ('deepseek_mtp', 'eagle', 'eagle3', 'pangu_ultra_moe_mtp', 'qwen3_mtp', 'pangu_moe_v2_mtp'), while get {self.method}.")
@@ -230,21 +231,14 @@ class PostDrafter(EagleProposer):
                             output = self.main_sampler.apply_sampling_params(
                                 drafter_logits[last_accepted_index], sampling_metadata, None, input_ids[last_accepted_index])
                             if isinstance(output, tuple):
-                                mtp_probs, mtp_ids = output
+                                mtp_probs, _ = output
                             else:
                                 all_sampled_tokens = output.argmax(dim=-1)
                                 mtp_probs = torch.zeros_like(output)
                                 mtp_probs[self.arange[:batch_size], all_sampled_tokens] = 1
 
-                            if self.topk > 0:
-                                mtp_topk_token_probs = mtp_probs[:, -self.topk:]
-                                mtp_topk_token_ids = mtp_ids[:, -self.topk:]
-                                mtp_selected_indices = random_choice(mtp_topk_token_probs, {}, self.dsa_stream)
-                                self.rejection_sampler.main_sampler.prob_cache.update_sparse_rejection_sampler(mtp_topk_token_ids, mtp_topk_token_probs, mtp_selected_indices, i)
-                                draft_forward_tokens = mtp_topk_token_ids[self.arange[:batch_size], mtp_selected_indices].view(-1)
-                            else:
-                                draft_forward_tokens = random_choice(mtp_probs, {}, self.dsa_stream)
-                                self.rejection_sampler.main_sampler.prob_cache.update_sparse_rejection_sampler(None, mtp_probs, None, i)
+                            draft_forward_tokens = random_choice(mtp_probs, {}, self.main_sampler.sampler_preparing_stream)
+                            self.rejection_sampler.main_sampler.prob_cache.update_cached_probs(i, mtp_probs)
                             draft_forward_tokens_list.append(draft_forward_tokens)
                         else:
                             draft_forward_tokens = drafter_logits[last_accepted_index].argmax(dim=-1)

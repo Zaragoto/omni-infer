@@ -1,0 +1,13 @@
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 7eb0fdaf2..993c42766 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -1338,7 +1338,7 @@ class OpenAIServingChat(OpenAIServing):
+                     # the type to make it later.
+                     message = ChatMessage(role=role,
+                                           reasoning_content=reasoning_content,
+-                                          content=content)
++                                          content=tool_call_info.content)
+ 
+             # undetermined case that is still important to handle
+             else:

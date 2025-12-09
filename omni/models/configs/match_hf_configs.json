@@ -65,6 +65,17 @@
         "n_shared_experts": null,
         "moe_intermediate_size": null
     },
+    "pangu-38B":{
+        "model_type": "PanguEmbeded",
+        "hidden_size": 6144,
+        "num_attention_heads": 48,
+        "max_position_embeddings": 32768,
+        "vocab_size": 165664,
+        "intermediate_size": 27648,
+        "n_routed_experts": null,
+        "n_shared_experts": null,
+        "moe_intermediate_size": null
+    },
     "pangu-72B":{
         "model_type": "PanguProMoE",
         "hidden_size": 5120,

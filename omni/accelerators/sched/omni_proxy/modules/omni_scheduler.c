@@ -826,7 +826,7 @@ void omni_proxy_schedule_decode(omni_global_state_t *gs, ngx_http_omni_loc_conf_
 
             uint32_t load_tokens = gs->decode_states[j].num_tokens;
             uint32_t running = gs->decode_states[j].num_running;
-            if (load_tokens > olcf->max_batch_num_token || running > olcf->decode_max_num_seqs)
+            if (running > olcf->decode_max_num_seqs)
             {
                 continue;
             }
@@ -840,7 +840,7 @@ void omni_proxy_schedule_decode(omni_global_state_t *gs, ngx_http_omni_loc_conf_
                 best_idx = j;
             }
         }
-
+        cnt = 0;
         for (int m = gs->last_selected_decode;
             m < MAX_DECODE_UPSTREAMS + gs->last_selected_decode && cnt < gs->num_decode_endpoints; m++) {
             int j = m % MAX_DECODE_UPSTREAMS;

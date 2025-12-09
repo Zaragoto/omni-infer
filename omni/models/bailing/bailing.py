@@ -73,65 +73,13 @@ from omni.adaptors.vllm.distributed.parallel_state import (
 from omni.layers.attention.backend.attention import AscendAttentionState
 from omni.layers.rotary_embedding import get_rope
 from omni.layers.moe.fused_moe.layer import FusedMoE
-from omni.layers.moe.deepseek_moe import DeepseekMoE
+from omni.layers.moe.deepseek_moe import DeepseekMoE, ParallelDeepseekMLP
 from omni.models.config_loader.loader import model_extra_config
 
 
 """MLP module activation split length, split by 64G VRAM, need to confirm the optimal split length based on sequence length and performance"""
 SEQ_SPLIT_LENGTH_BEFORE_ALL_GATHER = 64
 
-
-class ParallelDeepseekMLP(nn.Module):
-
-    def __init__(
-            self,
-            hidden_size: int,
-            intermediate_size: int,
-            hidden_act: str,
-            quant_config: Optional[QuantizationConfig] = None,
-            reduce_results: bool = True,
-            prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.prefix = prefix
-        self.gate_up_proj = AscendMergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
-            tp_size=get_mlp_tp_group().world_size,
-            tp_rank=get_mlp_tp_group().rank_in_group,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj")
-        self.down_proj = AscendRowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           tp_size=get_mlp_tp_group().world_size,
-                                           tp_rank=get_mlp_tp_group().rank_in_group,
-                                           quant_config=quant_config,
-                                           reduce_results=False,
-                                           prefix=f"{prefix}.down_proj")
-        if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
-        self.act_fn_obj = SiluAndMul()
-        self.quant_symbol = True if quant_config else False
-
-    def act_fn(self, x, quant_symbol):
-        if quant_symbol and isinstance(x, tuple):
-            x = dict(zip(['x_int8', 'pertoken_scale'], x))
-            x['out_scale'] = self.gate_up_proj.weight_scale
-        return self.act_fn_obj(x, quant_symbol)
-
-
-    def forward(self, x, residual, attn_metadata, layerid=None):
-        x = get_mlp_tp_group().all_gather(x, dim=0)
-
-        gate_up, _ = self.gate_up_proj.forward(x)
-        x = self.act_fn(gate_up, self.quant_symbol)
-        x, _ = self.down_proj.forward(x)
-
-        # P and D are both cut, and are concave at the node (16)
-        x = get_mlp_tp_group().reduce_scatter(x)
-        return x, residual
 
 
 class BaiLingAttention(nn.Module):

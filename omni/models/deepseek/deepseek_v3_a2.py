@@ -333,10 +333,8 @@ class DeepseekDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            # hidden_states, residual = self.input_layernorm(
-            #     hidden_states, residual, quant_symbol=True)
             hidden_states, residual = self.input_layernorm(
-                hidden_states, residual, quant_symbol=True)
+                hidden_states, residual, quant_symbol=(not model_extra_config.operator_opt_config.use_mlaprolog and not model_extra_config.operator_opt_config.enable_dsa))
 
         hidden_states = self.self_attn(
             positions=positions,

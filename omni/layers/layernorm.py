@@ -8,27 +8,11 @@ from typing import Optional, Union, Any
 from vllm.model_executor.layers.layernorm import RMSNorm as RMSNormGPU
 from vllm.distributed import get_tp_group
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
-import os
 
 from omni.models.config_loader.loader import model_extra_config
 
 
 class RMSNorm(RMSNormGPU):
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        var_hidden_size: Optional[int] = None,
-        has_weight: bool = True,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
-        super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)
-
-        self.bias = None
-        load_rmsnorm_bias = os.environ.get("LOAD_RMSNORM_BIAS", 0)
-        if load_rmsnorm_bias == 1:
-            self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
-
     def forward(
             self,
             x: torch.Tensor,
@@ -37,8 +21,6 @@ class RMSNorm(RMSNormGPU):
     ) -> Union[tuple[dict[str, Any], Any], Any]:
         if residual is not None:
             x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
-            if self.bias is not None:
-                x.add_(self.bias)
             if quant_symbol:
                 x_int8, pertoken_scale = torch_npu.npu_dynamic_quant(x)
                 x = {"x_int8": x_int8, "pertoken_scale": pertoken_scale}
@@ -71,8 +53,6 @@ class RMSNormFlashComm(RMSNorm):
     ) -> Union[tuple[dict[str, Any], Any], Any]:
         if residual is not None:
             x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
-            if self.bias is not None:
-                x.add_(self.bias)
             if y_transform == "AG":
                 x = get_tp_group().all_gather(x, dim=0)
             return x, residual
@@ -91,8 +71,6 @@ class RMSNormFlashComm(RMSNorm):
     ) -> Union[tuple[dict[str, Any], Any], Any]:
         if residual is not None:
             x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
-            if self.bias is not None:
-                x.add_(self.bias)
             if y_transform == "AG":
                 x = get_tp_group().all_gather(x, dim=0)
             return x, residual

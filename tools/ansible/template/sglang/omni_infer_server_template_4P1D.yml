@@ -102,7 +102,7 @@
       # export TASK_QUEUE_ENABLE=2
       # export CPU_AFFINITY_CONF=1
       # export OMP_NUM_THREADS=1
-      export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
+      export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=12000
 
       rm -rf .torchair_cache/
       python3 -m sglang.launch_server \
@@ -153,7 +153,7 @@
       export ASCEND_TRANSFER_TIMEOUT=30000
       export ROLE=decode
 
-      export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200
+      export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=12000
 
       dp=$(echo -n "$DECODE_DATA_PARALLEL_SIZE" | tr -cd ',' | wc -c)
       ((dp++))
@@ -196,6 +196,7 @@
         --ep-size ${dp} \
         --pp-size 1 \
         --enable-multi-api-server \
+        --context-length 44000 \
         --max-running-requests 2048 > ${LOG_PATH}/run_decode_sglang.log 2>&1 &
 
     run_proxy_cmd: |
@@ -225,56 +226,10 @@
         done
       done
 
-      export http_proxy="http://p_atlas:proxy%40123@172.18.100.92:8080"
-      export https_proxy="http://p_atlas:proxy%40123@172.18.100.92:8080"
-      export GIT_SSL_NO_VERIFY=true
-      mkdir /tmp/omnipath
-      cd /tmp/omnipath
-      git config --global http.sslVerify "false"
-      # git clone https://gitee.com/wuhang1991/omniinfer.git -b forsglang
-      git clone -b gproxy_sgl https://gitee.com/august_ust/omniinfer_sgl.git 
-      mv /tmp/omnipath/omniinfer_sgl /tmp/omnipath/omniinfer
-      cd /tmp/omnipath/omniinfer/omni/accelerators/sched/global_proxy
-
-      unset http_proxy
-      unset https_proxy
-      export http_proxy="http://p_atlas:proxy%40123@172.18.100.92:8080"
-      export https_proxy="http://p_atlas:proxy%40123@172.18.100.92:8080"
-      export no_proxy=127.0.0.1,.huawei.com,localhost,local,.local
-
-      NGINX_VERSION="${NGINX_VERSION:-1.24.0}"
-      if [ ! -f "nginx-${NGINX_VERSION}.tar.gz" ]; then
-        wget --no-check-certificate "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" > ${LOG_PATH}/install_nginx.log 2>&1
-      fi
-
-      tar -zxf "nginx-${NGINX_VERSION}.tar.gz"
-      
-      rm  -ivf /etc/yum.repos.d/*
-
-      echo "[openEuler-everything]
-      name=openEuler-everything
-      baseurl=http://mirrors.tools.huawei.com/openeuler/openEuler-22.03-LTS-SP4/everything/aarch64/
-      enabled=1
-      gpgcheck=0
-      gpgkey=http://mirrors.tools.huawei.com/openeuler/openEuler-22.03-LTS-SP4/everything/aarch64/RPM-GPG-KEY-openEuler
-      [openEuler-EPOL]
-      name=openEuler-epol
-      baseurl=http://mirrors.tools.huawei.com/openeuler/openEuler-22.03-LTS-SP4/EPOL/main/aarch64/
-      enabled=1
-      gpgcheck=0
-      [openEuler-update]
-      name=openEuler-update
-      baseurl=http://mirrors.tools.huawei.com/openeuler/openEuler-22.03-LTS-SP4/update/aarch64/
-      enabled=1
-      gpgcheck=0" > /etc/yum.repos.d/openeuler.repo
-      
-      bash build.sh >> ${LOG_PATH}/install_nginx.log 2>&1
-      cd /workspace/omniinfer/omni/accelerators/sched/omni_proxy
-      bash build.sh >> ${LOG_PATH}/install_nginx.log 2>&1      
-      unset http_proxy
-      unset https_proxy
-
       if [ ${USE_OMNI_PROXY} = "1" ]; then
+        cd /workspace/omniinfer/omni/accelerators/sched/omni_proxy
+        bash build.sh --skip-extras >> ${LOG_PATH}/install_nginx.log 2>&1
+
         cd /workspace/omniinfer/tools/scripts
         bash omni_proxy.sh \
           --omni-proxy-schedule-algo default \
@@ -289,6 +244,9 @@
           --start-core-index 0 \
           --omni-proxy-pd-policy parallel >> ${LOG_PATH}/nginx_error.log 2>&1
       else
+        cd /workspace/omniinfer/omni/accelerators/sched/global_proxy
+        bash build.sh >> ${LOG_PATH}/install_nginx.log 2>&1
+
         cd /workspace/omniinfer/tools/scripts
         bash global_proxy.sh \
           --listen-port "$PROXY_NODE_PORT" \
@@ -360,6 +318,7 @@
 
     docker_cp_prefill_code_cmd: "docker cp {{ ansible_env.CODE_PATH }}/omniinfer $DOCKER_NAME_P:/workspace/"
     docker_cp_decode_code_cmd: "docker cp {{ ansible_env.CODE_PATH }}/omniinfer $DOCKER_NAME_D:/workspace/"
+    docker_cp_proxy_code_cmd: "docker cp {{ ansible_env.CODE_PATH }}/omniinfer $DOCKER_NAME_C:/workspace/"
     docker_update_prefill_code_cmd: "{{ docker_exec_cmd }} $DOCKER_NAME_P /bin/bash -c '. ~/.bashrc && cd /workspace/omniinfer/infer_engines && git config --global --add safe.directory /workspace/omniinfer/infer_engines/sglang && pip uninstall sglang -y && pip uninstall omni_infer -y && cd sglang/python && pip install -e . --no-deps --no-build-isolation && cd ../../../ && pip install -e . --no-deps --no-build-isolation > ${LOG_PATH}/{{ inventory_hostname }}_pip.log'"
     docker_update_decode_code_cmd: "{{ docker_exec_cmd }} $DOCKER_NAME_D /bin/bash -c '. ~/.bashrc && cd /workspace/omniinfer/infer_engines && git config --global --add safe.directory /workspace/omniinfer/infer_engines/sglang && pip uninstall sglang -y && pip uninstall omni_infer -y && cd sglang/python && pip install -e . --no-deps --no-build-isolation && cd ../../../ && pip install -e . --no-deps --no-build-isolation > ${LOG_PATH}/{{ inventory_hostname }}_pip.log'"
 
@@ -566,6 +525,13 @@
       environment: 
         DOCKER_NAME_D: "{{ ACTUAL_DOCKER_NAME_D }}"
       when: "'D' in group_names"
+      tags: sync_code
+
+    - name: Copy the code from the host machine into the container (proxy).
+      command: bash -c "{{ docker_cp_proxy_code_cmd }}"
+      environment: 
+        DOCKER_NAME_C: "{{ ACTUAL_DOCKER_NAME_C }}"
+      when: "'C' in group_names"
       tags: sync_code
 
     - name: docker_update_prefill_code_cmd.

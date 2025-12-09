@@ -6,6 +6,7 @@ import os
 import concurrent.futures
 import logging
 import torch
+import torch_npu
 from torch import nn
 import torchair as tng
 from transformers import PretrainedConfig
@@ -37,8 +38,31 @@ logger = logging.getLogger(__name__)
 """MLP module activation split length, split by 64G VRAM, need to confirm the optimal split length based on sequence length and performance"""
 SEQ_SPLIT_LENGTH_BEFORE_ALL_GATHER = 64
 
+MAX_ATTN_PREFETCH_SIZE = 18
+MB_TO_BYTES = 1024 * 1024
+
 class LongcatFlashMLP(ParallelDeepseekMLP):
-    pass
+    def __init__(self,*args, **kwargs,):
+        super().__init__(*args, **kwargs)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        use_reduce_scatter: bool = False,
+        return_down_hidden_status: bool = False,
+        **kwargs):
+        x = hidden_states
+        x = get_mlp_tp_group().all_gather(x, dim=0)
+        
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up, self.quant_symbol)
+        down_hidden_status, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
+        x = down_hidden_status
+        x = get_mlp_tp_group().reduce_scatter_(x)
+        
+        if return_down_hidden_status:
+            return x, down_hidden_status
+        return x
 
 class LongcatFlashDecoderLayer(nn.Module):
     def __init__(
@@ -77,7 +101,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     rope_scaling=getattr(config, "rope_scaling", None),
                     rope_is_neox_style=True,
                     max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
-                    quant_config=None,
+                    quant_config=quant_config,
                     layer_id=layer_id,
                     reduce_results=False,
                     prefix=add_prefix(f"self_attn.{i}", prefix)
@@ -122,6 +146,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        next_layer = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -145,8 +170,12 @@ class LongcatFlashDecoderLayer(nn.Module):
             moe_hidden_states = self.mlp(hidden_states_norm, forward_batch)
 
         with tng.scope.limit_core_num(16, 32):
-            hidden_states = self.mlps[0](hidden_states_norm, forward_batch)
-
+            hidden_states, down_hidden_status = self.mlps[0](hidden_states_norm, forward_batch,return_down_hidden_status=True)
+            use_prefetch = model_extra_config.operator_opt_config.use_prefetch
+            # prefetch self.q_a_proj.weight, self.q_b_proj.weight
+            self._npu_prefetch(use_prefetch, self.self_attn[1].q_a_proj.weight, down_hidden_status)
+            self._npu_prefetch(use_prefetch, self.self_attn[1].q_b_proj.weight, down_hidden_status)
+                
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm[1](hidden_states)
@@ -165,7 +194,11 @@ class LongcatFlashDecoderLayer(nn.Module):
 
             hidden_states, residual = self.post_attention_layernorm[1](hidden_states, residual)
 
-            hidden_states = self.mlps[1](hidden_states, forward_batch)
+            hidden_states, down_hidden_status = self.mlps[1](hidden_states, forward_batch, return_down_hidden_status=True)
+            if next_layer is not None:
+                self._npu_prefetch(use_prefetch, next_layer.self_attn[0].q_a_proj.weight, down_hidden_status)
+                self._npu_prefetch(use_prefetch, next_layer.self_attn[0].q_b_proj.weight, down_hidden_status, 36 * MB_TO_BYTES)
+                self._npu_prefetch(use_prefetch, next_layer.self_attn[0].kv_a_proj_with_mqa.weight, down_hidden_status,7 * MB_TO_BYTES)
             
             try:
                 tng.scope.npu_wait_tensor(hidden_states, moe_hidden_states)
@@ -180,6 +213,11 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def _npu_prefetch(self, switch_flag, weight, depend, size=MAX_ATTN_PREFETCH_SIZE * MB_TO_BYTES, offset=0):
+        if not switch_flag:
+            return None
+        return torch_npu.npu_prefetch(weight, depend, size, offset)
+        
     def forward(
         self,
         positions: torch.Tensor,
@@ -187,12 +225,13 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        next_layer = None,
         **kwargs,
     ) -> torch.Tensor:
         is_prefill = forward_batch.is_extend_in_batch
         if self.enable_multi_stream and not is_prefill:
             return self.forward_multi_stream(
-                positions, hidden_states, forward_batch, residual, zero_allocator, **kwargs
+                positions, hidden_states, forward_batch, residual, zero_allocator, next_layer, **kwargs
             )
 
         # Self Attention
@@ -314,7 +353,9 @@ class LongcatFlashModel(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
-                zero_allocator)
+                zero_allocator,
+                next_layer=self.layers[i + 1] if i < total_num_layers - 1 else None,
+                )
 
         if not forward_batch.is_prefill_idle:
             if residual is None:

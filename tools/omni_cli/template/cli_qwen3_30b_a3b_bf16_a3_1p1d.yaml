@@ -30,6 +30,8 @@ all:
           ansible_user: root
           args:
             additional-config:
+              multi_step: 4
+              async_pull_kv: true
               graph_model_compile_config:
                 level: 1
                 use_ge_graph_cached: true
@@ -106,7 +108,7 @@ all:
             PREFILL_POD_NUM: 1
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
             RANKTABLE_SAVE_PATH: /tmp/ranktable_save_path
-            RANK_TABLE_FILE_PATH: $(ls /tmp/ranktable_save_path/decode_config/local_*.json)
+            RANK_TABLE_FILE_PATH: $(ls ${RANKTABLE_SAVE_PATH}/decode_config/local_*.json)
             ROLE: decode
             SERVER_IP_LIST: 127.0.0.2
             SERVER_OFFSET: 0

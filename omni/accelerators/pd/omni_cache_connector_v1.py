@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import asyncio
 import json
 import os
 import sys
@@ -47,6 +48,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.model_executor.models.utils import extract_layer_index
 
 from omni.models.config_loader.loader import model_extra_config
+
+import multiprocessing
 
 GET_META_MSG = b"get_meta_msg"
 logger = init_logger(__name__)
@@ -255,7 +258,7 @@ class PendingReq:
 
 
 class _ZMQSendProxy:
-    def __init__(self, send_q: "queue.Queue[_SendItem]"):
+    def __init__(self, send_q: "multiprocessing.Queue[_SendItem]"):
         self._q = send_q
 
     def send_request(self, request_id: str, cluster_id: int, src_id_list: List[int], dst_id_list: List[int], rank_id: int) -> bool:
@@ -689,8 +692,6 @@ class DecodeConnectorScheduler:
 class DecodeConnectorWorker:
     """Worker implementation for datadist (decode)."""
 
-    _h2d_wait = threading.Event()
-
     def __init__(self, vllm_config: "VllmConfig", host_ip: str, cluster_id_start: int):
         self.vllm_config = vllm_config
         self.cluster_id_start = cluster_id_start
@@ -708,7 +709,7 @@ class DecodeConnectorWorker:
         # manager_cls = LLMDataDistManager
         # self.datadist_manager = manager_cls(vllm_config)
 
-        self._recving_transfers: List[str] = []
+        self._recving_transfers = queue.Queue()
         self._done_recving_count: defaultdict[str, int] = defaultdict(lambda: 0)
 
         self._pull_kv_lock = threading.Lock()
@@ -734,20 +735,27 @@ class DecodeConnectorWorker:
             logger.warning("DecodeConnectorWorker initialized with self.async_pull_kv enabled.")
 
         self._transfer_lock = getattr(self, "_transfer_lock", threading.Lock())
-        self._recving_transfers = getattr(self, "_recving_transfers", [])
+        self._recving_transfers = getattr(self, "_recving_transfers", queue.Queue())
         self._endpoint = f"tcp://127.0.0.1:{ZMQ_BASE_PORT}"
         self.zmq_client = None
-        self._send_q: "queue.Queue[_SendItem]" = queue.Queue()
-        self._resp_thread: Optional[threading.Thread] = None
-        self._resp_stop = threading.Event()
 
-        import queue as _q
-        self._h2d_q: "_q.Queue[PendingReq]" = _q.Queue(maxsize=1024)
+        self._send_q: "multiprocessing.Queue[_SendItem]" = multiprocessing.Queue()
+        self._resp_process: Optional[multiprocessing.Process] = None
+        self._resp_stop = multiprocessing.Event()
+
+        self._address_process: Optional[multiprocessing.Process] = None
+        self._address_stop = multiprocessing.Event()
+        self._recv_q:  "multiprocessing.Queue[_SendItem]" = multiprocessing.Queue()
+
+        self._h2d_q: "multiprocessing.Queue[PendingReq]" = multiprocessing.Queue(maxsize=1024)
         self._h2d_stop = threading.Event()
         self._h2d_thread: Optional[threading.Thread] = None
 
-        self._pending: Dict[str, PendingReq] = {}
-        self._pending_lock = threading.Lock()
+        self._process_monitor_stop = threading.Event()
+        self._process_monitor_thread: Optional[threading.Thread] = None
+
+        self._mgr = multiprocessing.Manager()
+        self._pending = self._mgr.dict()
 
         # self.h2d_stream = torch.npu.Stream()
 
@@ -813,6 +821,7 @@ class DecodeConnectorWorker:
             t_print.start()
         self.zmq_client = None
         self.omni_cache = omni_cache
+        self._ensure_process_started()
 
 
     # Now go asynchronous pull_kv
@@ -899,19 +908,18 @@ class DecodeConnectorWorker:
     ):
         start = time.time()
 
-        self._ensure_resp_thread_started()
-
-        with self._pending_lock:
-            self._pending[request_id] = PendingReq(
-                request_id=request_id,
-                local_block_ids=local_block_ids,
-                remote_block_ids=remote_block_ids,
-                dst_cluster_id=dst_cluster_id,
-                remote_request_id=remote_request_id,
-                remote_host_ip=remote_host_ip,
-                dp_rank=self.omni_cache.dp_local_rank,
-                t_submit=start,
-            )
+        req = PendingReq(
+            request_id=request_id,
+            local_block_ids=local_block_ids,
+            remote_block_ids=remote_block_ids,
+            dst_cluster_id=dst_cluster_id,
+            remote_request_id=remote_request_id,
+            remote_host_ip=remote_host_ip,
+            dp_rank=self.omni_cache.dp_local_rank,
+            t_submit=start,
+        )
+        req.t_sent = start
+        self._pending[request_id] = req
 
         self.zmq_client.send_request(
             request_id=request_id,
@@ -921,19 +929,35 @@ class DecodeConnectorWorker:
             rank_id=self.omni_cache.dp_local_rank,
         )
 
-        enqueue_cost = time.time() - start
-        logger.warning(" ***** read block-send request (enqueued): req_id:%s, cost:%.6f",
-                       request_id, enqueue_cost)
+        logger.warning("Adding Sent Queue req_id=%s in %.6f s",
+                       request_id, time.time() - start)
 
-    def _ensure_resp_thread_started(self):
-        if not (self._resp_thread and self._resp_thread.is_alive()):
+    def _ensure_process_started(self):
+        # Process
+        if not (self._resp_process and self._resp_process.is_alive()):
             self._resp_stop.clear()
-            self._resp_thread = threading.Thread(
-                target=self._get_zmq_response, name="ZMQ-Recv-Thread", daemon=True
+            self._resp_process = multiprocessing.Process(
+                target=self._process_zmq, name="ZMQ-Recv-Thread", daemon=True
             )
-            self._resp_thread.start()
+            self._resp_process.start()
             self.zmq_client = _ZMQSendProxy(self._send_q)
             logger.info("ZMQ receive thread started at %s", self._endpoint)
+        
+        if not (self._address_process and self._address_process.is_alive()):
+            self._address_stop.clear()
+            self._address_process = multiprocessing.Process(
+                target=self._process_h2d_address, name="Address-Process", daemon=True
+            )
+            self._address_process.start()
+            logger.info("Address-Processat %s", self._endpoint)
+        
+        # Thread
+        def monitor():
+            while not self._process_monitor_stop.is_set():
+                is_alive = [self._resp_process.is_alive(), self._address_process.is_alive()]
+                if sum(is_alive) != len(is_alive):
+                    logger.warning(f"[self._resp_process.is_alive(), self._address_process.is_alive()] = {is_alive}")
+                time.sleep(1)
 
         if not (self._h2d_thread and self._h2d_thread.is_alive()):
             self._h2d_stop.clear()
@@ -942,107 +966,114 @@ class DecodeConnectorWorker:
             )
             self._h2d_thread.start()
             logger.info("H2D worker thread started")
+        
+        if not (self._process_monitor_thread and self._process_monitor_thread.is_alive()):
+            self._process_monitor_stop.clear()
+            self._process_monitor_thread = threading.Thread(
+                target=monitor, name="Process Monitor", daemon=True
+            )
+            self._process_monitor_thread.start()
+            logger.info("Process Monitor thread started")
 
-    def _get_zmq_response(self):
+    def _process_zmq(self):
         client = RouterDealerClient(self._endpoint)
-        try:
-            while not self._resp_stop.is_set():
-                while True:
-                    try:
-                        item: _SendItem = self._send_q.get_nowait()
-                    except queue.Empty:
-                        break
-                    t0 = time.time()
-                    ok = client.send_request(
-                        request_id=item.request_id,
-                        cluster_id=item.cluster_id,
-                        src_id_list=item.src_ids,
-                        dst_id_list=item.dst_ids,
-                        rank_id=item.rank_id,
-                    )
-                    with self._pending_lock:
-                        if item.request_id in self._pending:
-                            ctx = self._pending[item.request_id]
-                            ctx.t_sent = time.time()
-                            try:
-                                if ok:
-                                    ids0 = ctx.local_block_ids[0] if ctx.local_block_ids else []
-                                    if ids0:
-                                        if not hasattr(self, "_prebuilt_block_tables"):
-                                            self._prebuilt_block_tables = {}
-                                        if item.request_id not in self._prebuilt_block_tables:
-                                            self._prebuilt_block_tables[item.request_id] = torch.tensor(
-                                                ids0, dtype=torch.long, device=self.omni_cache.device
-                                            )
-                            except Exception as e:
-                                logger.debug("Prebuild block_table_ts failed for req_id=%s: %s", item.request_id, e)
-                    if not ok:
-                        logger.error("Send failed for req_id=%s", item.request_id)
-                        with self._pending_lock:
-                            self._pending.pop(item.request_id, None)
-                        if hasattr(self, "_prebuilt_block_tables"):
-                            self._prebuilt_block_tables.pop(item.request_id, None)
-                    else:
-                        logger.debug("Sent req_id=%s in %.6f s", item.request_id, time.time() - t0)
-                    self._send_q.task_done()
 
-                resp = client.receive_response(timeout=50)
-                if resp is None:
-                    continue
+        async def sender():
+            while not self._resp_stop.is_set():
+                try:
+                    item: _SendItem = await asyncio.to_thread(self._send_q.get)
+                except asyncio.CancelledError:
+                    break
+                t0 = time.time()
+                ok = client.send_request(
+                    request_id=item.request_id,
+                    cluster_id=item.cluster_id,
+                    src_id_list=item.src_ids,
+                    dst_id_list=item.dst_ids,
+                    rank_id=item.rank_id,
+                )
+                if not ok:
+                    raise ValueError(f"Send failed for req_id={item.request_id}")
+                else:
+                    logger.debug("Sent req_id=%s in %.6f s", item.request_id, time.time() - t0)
+
+        async def receiver():
+            while not self._resp_stop.is_set():
+                try:
+                    resp = await asyncio.to_thread(client.receive_response, None)
+                except asyncio.CancelledError:
+                    break
 
                 req_id = resp.get("request_id")
                 success = bool(resp.get("success"))
                 if not req_id:
-                    logger.error("Received response without request_id: %s", resp)
-                    continue
-
-                with self._pending_lock:
-                    ctx = self._pending.get(req_id)
-                    if ctx:
-                        ctx.t_resp = time.time()
-
-                if not ctx:
-                    logger.warning("Orphan response for unknown req_id=%s", req_id)
-                    if hasattr(self, "_prebuilt_block_tables"):
-                        self._prebuilt_block_tables.pop(req_id, None)
-                    continue
-
-                self._log_network_timing(ctx)
-
+                    raise ValueError(f"Received response without request_id: {resp}")
                 if not success:
-                    logger.error("Failed to pull kv for request %s", req_id)
-                    with self._pending_lock:
-                        self._pending.pop(req_id, None)
-                    if hasattr(self, "_prebuilt_block_tables"):
-                        self._prebuilt_block_tables.pop(req_id, None)
-                    continue
+                    raise ValueError(f"Failed to pull kv of request {req_id}")
 
                 try:
-                    self._h2d_q.put(ctx, timeout=1.0)
-                except queue.Full:
-                    logger.warning("H2D queue full, running _post_success inline (may block IO)")
-                    self._post_success(ctx)
-                    with self._pending_lock:
-                        self._pending.pop(req_id, None)
-        finally:
-            client.close()
+                    await asyncio.to_thread(self._recv_q.put, req_id)
+                except asyncio.CancelledError:
+                    break
 
+        async def async_main():
+            sender_task = asyncio.create_task(sender())
+            receiver_task = asyncio.create_task(receiver())
+            while not self._resp_stop.is_set():
+                await asyncio.sleep(0.5)
+            sender_task.cancel()
+            receiver_task.cancel()
+        
+        asyncio.run(async_main())
+    
+    def _process_h2d_address(self):
+        while not self._address_stop.is_set():
+            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs = [], [], [], [], []
+            start_time = time.time()
+            while True:
+                try:
+                    req_id = self._recv_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                ctx = self._pending.get(req_id)
+                if ctx:
+                    ctx.t_resp = time.time()
+                if not ctx:
+                    raise ValueError("Orphan response for unknown req_id=%s", req_id)
+                self._log_network_timing(ctx)
+
+                micro_batch_device_mem, micro_batch_device_max, micro_batch_host_mem, micro_batch_host_sizes = self.omni_cache.build_h2d_ops(
+                    ctx.local_block_ids,
+                    CLUSTER_SIZE
+                )
+                batch_device_mem.extend(micro_batch_device_mem)
+                batch_device_max.extend(micro_batch_device_max)
+                batch_host_mem.extend(micro_batch_host_mem)
+                batch_host_sizes.extend(micro_batch_host_sizes)
+                ctxs.append(ctx)
+            
+            if len(ctxs)>0:
+                logger.debug(f" ***** process batch copy address: len(req_id): {len(ctxs)}, cost: {time.time()-start_time} s")
+                self._h2d_q.put((batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs))
+    
     def _h2d_worker(self):
+        self.omni_cache.host_cache.ascend_cl_stream.create()
         while not self._h2d_stop.is_set():
+            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs = self._h2d_q.get()
+            t_h2d_start = time.time()
             try:
-                ctx: PendingReq = self._h2d_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                self._post_success(ctx)
+                self._post_success(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs)
             except Exception as e:
-                logger.exception("H2D worker error on req_id=%s: %s", ctx.request_id, e)
+                logger.exception("H2D worker error on req_id=%s: %s", ",".join([str(ctx.request_id) for ctx in ctxs]), e)
             finally:
-                with self._pending_lock:
+                for ctx in ctxs:
                     self._pending.pop(ctx.request_id, None)
-                if hasattr(self, "_prebuilt_block_tables"):
-                    self._prebuilt_block_tables.pop(ctx.request_id, None)
-                self._h2d_q.task_done()
+            
+            t_h2d_end = time.time()
+            logger.debug(" **** Time cost of decode synchronize_h2d is %.3f ms len(req_id):%s", (t_h2d_end-t_h2d_start) * 1000.0, len(ctxs))
+            total_cost = [round(t_h2d_end - ctx.t_submit, 6) for ctx in ctxs]
+            logger.debug(f" **** Read block Total: len(req_id): {len(ctxs)}, cost: {total_cost} s")
 
     def _log_network_timing(self, ctx: PendingReq):
         t_submit = ctx.t_submit
@@ -1060,56 +1091,46 @@ class DecodeConnectorWorker:
             ctx.request_id, num_blocks, cost_submit_to_send, cost_send_to_resp, cost_submit_to_resp
         )
 
-    def _post_success(self, ctx: PendingReq):
-        t_submit = ctx.t_submit
-        t_resp = ctx.t_resp if ctx.t_resp > 0 else time.time()
-
+    def _post_success(self, batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs):
+        
         if self.omni_cache is None or self.omni_cache.device_cache is None:
             raise RuntimeError("Error! omni_cache is None or device_cache is None.")
-
-        DecodeConnectorWorker._h2d_wait.wait()
-        t_h2d_start = time.time()
-        block_table_ts = None
-        if hasattr(self, "_prebuilt_block_tables"):
-            block_table_ts = self._prebuilt_block_tables.pop(ctx.request_id, None)
-        # if self.h2d_stream:
-        #     with torch.npu.stream(self.h2d_stream):
-        #         self.omni_cache.synchronize_h2d(ctx.local_block_ids, CLUSTER_SIZE, block_table_ts)
-        #     compute_stream = torch.npu.current_stream()
-        #     compute_stream.wait_stream(self.h2d_stream)
-        # else:
-        self.omni_cache.synchronize_h2d(ctx.local_block_ids, CLUSTER_SIZE)
-        t_h2d_end = time.time()
-        logger.warning(" ***** Time cost of decode synchronize_h2d is %.3f ms (req_id:%s)",
-                       (t_h2d_end - t_h2d_start) * 1000.0, ctx.request_id)
+    
+        self.omni_cache.synchronize_h2d(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes)
         
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if tp_size == 1:
-            if ctx.remote_request_id is not None:
-                self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
-            with self._transfer_lock:
-                self._recving_transfers.append(ctx.request_id)
-        else:
-            torch.distributed.barrier(group=get_tp_group().cpu_group)
-            if get_tensor_model_parallel_rank() == 0 and ctx.remote_request_id is not None:
-                self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
-            with self._transfer_lock:
-                self._recving_transfers.append(ctx.request_id)
-
-        
-        total_cost = (time.time() - t_submit)
-        logger.warning(" ***** read block total: req_id:%s, cost:%.6f s", ctx.request_id, total_cost)
+        for ctx in ctxs:
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            if tp_size == 1:
+                if ctx.remote_request_id is not None:
+                    self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
+                self._recving_transfers.put(ctx.request_id)
+            else:
+                torch.distributed.barrier(group=get_tp_group().cpu_group)
+                if get_tensor_model_parallel_rank() == 0 and ctx.remote_request_id is not None:
+                    self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
+                self._recving_transfers.put(ctx.request_id)
 
     def stop_zmq_thread(self, wait: bool = True):
         self._resp_stop.set()
         self._h2d_stop.set()
-        DecodeConnectorWorker._h2d_wait.set()
-        if self._resp_thread and wait:
-            self._resp_thread.join(timeout=2.0)
+        self._address_stop.set()
+        self._process_monitor_stop.set()
+
+        if self._resp_process and wait:
+            self._resp_process.join(timeout=2.0)
+        if self._address_process and wait:
+            self._address_process.join(timeout=2.0)
+
         if self._h2d_thread and wait:
             self._h2d_thread.join(timeout=2.0)
-        self._resp_thread = None
+        if self._process_monitor_thread and wait:
+            self._process_monitor_thread.join(timeout=2.0)
+
+        self._resp_process = None
         self._h2d_thread = None
+        self._address_process = None
+        self._process_monitor_thread = None
+        self._mgr.shutdown()
 
     def _send_pulled_kv_req_list(self, path: str, data: List[str]):
         if path in self.zmq_socket_map:
@@ -1130,8 +1151,7 @@ class DecodeConnectorWorker:
     def get_finished(self, metadata: DatadistConnectorMetadata) -> Tuple[set[str], set[str]]:
         # for decode side, done_sending is not needed
         all_done_sending: set[str] = set()
-        with self._transfer_lock:
-            all_done_recving = self._pop_done_transfers(self._recving_transfers)
+        all_done_recving = self._pop_done_transfers(self._recving_transfers)
         if len(all_done_recving) > 0:
             logger.debug("Get_finished: %s requests done recving", len(all_done_recving))
 
@@ -1139,9 +1159,12 @@ class DecodeConnectorWorker:
 
     def _pop_done_transfers(self, transfers: List[str]) -> set[str]:
         done_req_ids: set[str] = set()
-        for req_id in transfers:
+        while True:
+            try:
+                req_id = transfers.get_nowait()
+            except queue.Empty:
+                break
             done_req_ids.add(req_id)
-        transfers.clear()
         return done_req_ids
 
 def handle_exception(future):
@@ -1234,7 +1257,3 @@ def stdout_printer(q: queue.Queue,
     finally:
         if file_obj is not None:
             file_obj.close()
-
-def decode_h2d_trigger():
-    DecodeConnectorWorker._h2d_wait.set()
-    DecodeConnectorWorker._h2d_wait.clear()

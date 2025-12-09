@@ -6,6 +6,7 @@ import os
 import torch, torch_npu
 import torchair as tng
 import torch.distributed as dist
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import get_world_group, get_pp_group, get_ep_group, get_tp_group
 from vllm.attention import AttentionMetadata
 from vllm.platforms import current_platform
@@ -68,7 +69,7 @@ class UnquantizedFusedMoEMethod(GPUUnquantizedFusedMoEMethod):
 
         if self.warm_up:
             # This is forced balancing, the goal is to reduce peak memory
-            global_rank = get_world_group().rank_in_group
+            global_rank = get_ep_group().rank_in_group
             step = hidden_states.shape[0] * topk_ids.shape[1]
             cur_topk_list = [
                 (i + global_rank // 1) % max_num_deployed_expert for i in range(
@@ -78,7 +79,7 @@ class UnquantizedFusedMoEMethod(GPUUnquantizedFusedMoEMethod):
             topk_ids = topk_ids.int()
 
         if model_extra_config.task_config.enable_omni_placement and layer.moe_layer_idx < 58:
-            max_num_deployed_expert = layer.planner.get_max_num_deployed_expert_per_rank() * get_world_group().world_size
+            max_num_deployed_expert = layer.planner.get_max_num_deployed_expert_per_rank() * get_ep_group().world_size
         expert_range = [0, max_num_deployed_expert]
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
@@ -93,8 +94,7 @@ class UnquantizedFusedMoEMethod(GPUUnquantizedFusedMoEMethod):
             row_idx_type=0,
             quant_mode=-1)
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
-        dist.all_to_all_single(tokens_per_expert_group,
-                               tokens_per_expert)  # (total_experts,) --> (total_ranks * n_routed_experts_per_rank)
+        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=get_ep_group().device_group)  # (total_experts,) --> (total_ranks * n_routed_experts_per_rank)
 
         # combine tensors, do reduceSum and D2H toghter
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
@@ -114,7 +114,7 @@ class UnquantizedFusedMoEMethod(GPUUnquantizedFusedMoEMethod):
             gathered_tokens = expanded_x.new_empty(
                 all_tokens.item(), expanded_x.shape[1]
             )
-            dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits)
+            dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=get_ep_group().device_group)
         else:
             gathered_tokens = expanded_x.clone()
 
@@ -145,15 +145,16 @@ class UnquantizedFusedMoEMethod(GPUUnquantizedFusedMoEMethod):
         if ep_size > 1:
             gathered_tokens = new_x.new_empty(*expanded_x.shape)
 
-            dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits)
+            dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=get_ep_group().device_group)
         else:
             gathered_tokens = new_x.clone()
 
         return hidden_states, gathered_tokens, topk_weight, expanded_row_idx
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
+        # Do not create a new object
+        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
+        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
         if model_extra_config.operator_opt_config.gmm_nz:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
@@ -165,6 +166,8 @@ class UnquantizedFusedMoEMethod(GPUUnquantizedFusedMoEMethod):
             self.local_expert_indices_offset + i for i in range(self.n_routed_experts)
         ]
         self.initialized = True
+        set_weight_attrs(layer.w13_weight, {"is_weight_transposed": True})
+        set_weight_attrs(layer.w2_weight, {"is_weight_transposed": True})
 
 
 class FusedMoE(torch.nn.Module):
@@ -263,11 +266,11 @@ class FusedMoE(torch.nn.Module):
         if model_extra_config.operator_opt_config.decode_moe_dispatch_combine:
             # Adapt the dispatch combine operator
             self.ep_size = get_ep_group().world_size
-            self.global_rank = get_world_group().rank_in_group
-            self.world_size = get_world_group().world_size
+            self.global_rank = get_ep_group().rank_in_group
+            self.world_size = get_ep_group().world_size
             # self.n_shared_experts = n_shared_experts
 
-            self.moe_all_to_all_group = get_world_group().device_group
+            self.moe_all_to_all_group = get_ep_group().device_group
             self.moe_all_to_all_group_name = self.moe_all_to_all_group._get_backend(
                 torch.device(current_platform.device_type)).get_hccl_comm_name(
                 self.global_rank)
@@ -458,6 +461,10 @@ class FusedMoE(torch.nn.Module):
 
         expert_data = param.data[expert_id]
 
+        is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_transposed:
+            expert_data = expert_data.t_()
+
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
         # should be whatever dimension intermediate_size is
@@ -542,6 +549,9 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank)
+            if is_weight_transposed:
+                expert_data = expert_data.t_()
+                param.data[expert_id] = expert_data
             return
 
 class FakeMoe():

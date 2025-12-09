@@ -728,6 +728,7 @@ class GptOssForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                                  vllm_config.quant_config,
                                  prefix=maybe_prefix(prefix, "model"))
         self.sampler = Sampler()
+        self.is_pd_seperate_d = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
 
         if get_pp_group().is_last_rank:
             if self.config.tie_word_embeddings:
@@ -793,29 +794,31 @@ class GptOssForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             sampling_metadata: SamplingMetadata,
             req_ids: list[str],
     ) -> torch.Tensor:
+        HIGH_PROBABILITY_CHOICE = 50
         past_token_lists = sampling_metadata.output_token_ids
         for i, past_tokens_ids in enumerate(past_token_lists):
             # Current processing is only applicable to Chat requests in OpenAI's Harmony format.
             if not req_ids[i].startswith('chat'):
                 continue
             # The first three tokens must be <|channel|>analysis<|message|> in open ai harmony format.
-            if len(past_tokens_ids) == 0:
-                logits[i, 200005] = torch.finfo(logits.dtype).max
-            if len(past_tokens_ids) == 1:
-                logits[i, 35644] = torch.finfo(logits.dtype).max
-            if len(past_tokens_ids) == 2:
-                logits[i, 200008] = torch.finfo(logits.dtype).max
+            if not self.is_pd_seperate_d:
+                if len(past_tokens_ids) == 0:
+                    logits[i, 200005] = HIGH_PROBABILITY_CHOICE
+                if len(past_tokens_ids) == 1:
+                    logits[i, 35644] = HIGH_PROBABILITY_CHOICE
+                if len(past_tokens_ids) == 2:
+                    logits[i, 200008] = HIGH_PROBABILITY_CHOICE
 
             if len(past_tokens_ids) >= 3:
                 # Rule 1: [<|channel|>(200005), final(17196)] → must be followed by <|message|>(200008)
                 if past_tokens_ids[-2] == 200005 and past_tokens_ids[-1] == 17196:
-                    logits[i, 200008] = torch.finfo(logits.dtype).max
+                    logits[i, 200008] = HIGH_PROBABILITY_CHOICE
                 # Rule 2: <|message|>(200008) → Avoid directly returning <|return|>(200002)
                 if past_tokens_ids[-1] == 200008:
                     logits[i, 200002] = float("-inf")
                 # Rule 3: <|call|>(200012) → must be followed by <|start|>(200006)
                 if past_tokens_ids[-1] == 200012:
-                    logits[i, 200006] = torch.finfo(logits.dtype).max
+                    logits[i, 200006] = HIGH_PROBABILITY_CHOICE
         return logits
 
     def sample(

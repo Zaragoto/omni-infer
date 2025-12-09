@@ -7,8 +7,7 @@ FROM ${BASE_IMAGE} AS whl_builder
 ARG HTTP_PROXY
 ARG PIP_INDEX_URL
 ARG PIP_TRUSTED_HOST
-ARG OMNI_VERSION_NUM
-
+ARG BRANCH
 WORKDIR /workspace
 
 # Install packages for build whl
@@ -20,6 +19,7 @@ RUN export http_proxy=${HTTP_PROXY} && \
 
 # Download source code and build whl
 COPY build_whl.sh /workspace/
+COPY codes /workspace/codes/
 RUN source ~/.bashrc && bash build_whl.sh && \
     mkdir -p /workspace/omniinfer/build/lib
 ####################### whl BUILD IMAGE ######################
@@ -50,18 +50,21 @@ ENTRYPOINT ["bash"]
 
 ######################### USER IMAGE #########################
 FROM ${BASE_IMAGE} AS user_image
-COPY requirements /workspace/requirements/
+COPY requirements /workspace/requirements
+COPY --from=whl_builder /workspace/codes/ /workspace/dist/codes
 COPY --from=whl_builder /workspace/omniinfer/build/dist /workspace/dist
 COPY --from=whl_builder /workspace/omniinfer/build/lib /workspace/dist/lib
-COPY --from=whl_builder /workspace/omniinfer/tools/scripts /workspace/omniinfer/tools/scripts/
-COPY --from=whl_builder /workspace/omniinfer/omni /workspace/omniinfer/omni/
-COPY --from=whl_builder /workspace/omniinfer/infer_engines /workspace/omniinfer/infer_engines/
-COPY --from=whl_builder /workspace/omniinfer/tests/test_config /workspace/omniinfer/tests/test_config/
+# COPY --from=whl_builder /workspace/omniinfer/tools/scripts /workspace/omniinfer/tools/scripts/
+# COPY --from=whl_builder /workspace/omniinfer/omni /workspace/omniinfer/omni/
+# COPY --from=whl_builder /workspace/omniinfer/infer_engines /workspace/omniinfer/infer_engines/
+# COPY --from=whl_builder /workspace/omniinfer/tests/test_config /workspace/omniinfer/tests/test_config/
 #TODO: Temporarily added source code
-#COPY --from=whl_builder /workspace/omniinfer /workspace/omniinfer/
+COPY --from=whl_builder /workspace/omniinfer /workspace/omniinfer/
 ARG HTTP_PROXY
 ARG PIP_INDEX_URL
 ARG PIP_TRUSTED_HOST
+ARG CUSTOM_OPS
+ARG NPU_PLATFORM
 
 # Install nessary pip packages for runtime
 RUN export http_proxy=${HTTP_PROXY} && \
@@ -69,8 +72,6 @@ RUN export http_proxy=${HTTP_PROXY} && \
     echo "export HCCL_IF_BASE_PORT=59000" >> ~/.bashrc; \
     echo "export HCCL_OP_RETRY_ENABLE=\"L0:0, L1:0, L2:0\"" >> ~/.bashrc; \
     source ~/.bashrc && \
-    pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} \
-        -r /workspace/requirements/develop.txt && \
     yum -y install glibc-devel gcc-c++ git gmock-devel vim wget iputils zeromq-devel && \
     if [ -f /workspace/dist/omni-proxy*.rpm ];then \
         yum install -y /workspace/dist/omni-proxy*.rpm; \
@@ -93,7 +94,37 @@ RUN export http_proxy=${HTTP_PROXY} && \
     if [ -f /workspace/dist/ascend*.whl ]; then \
         pip install /workspace/dist/ascend*.whl; \
     fi && \
-    rm -rf /workspace/dist && \
+    # If CUSTOM_OPS is provided (a comma-separated list or install script), iterate
+    # over each name and attempt to run matching .sh scripts.
+    if [ -n "${CUSTOM_OPS}" ]; then \
+        pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} \
+            google==3.0.0 expecttest==0.1.6 hypothesis==6.82.0 psutil==7.0.0 PyYAML==6.0 decorator==5.2.1 scipy==1.15.3 \
+            attrs==25.3.0 numpy==2.2.6  protobuf==4.25.8 && \
+        echo "CUSTOM_OPS specified: ${CUSTOM_OPS}"; \
+        # Split on commas and iterate; trim whitespace from each entry.
+        echo "${CUSTOM_OPS}" | tr ',' '\n' | while IFS= read -r op; do \
+            # trim leading/trailing whitespace
+            op="$(echo "$op" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"; \
+            [ -z "$op" ] && continue; \
+            echo "Processing custom op: $op"; \
+            found=0; \
+            # Run any matching scripts in /workspace/dist/codes
+            for script in /workspace/dist/codes/"$op".sh; do \
+                    if [ -f "$script" ]; then \
+                    found=1; echo "Running $script"; chmod +x "$script" && /bin/bash "$script" --npu-platform "${NPU_PLATFORM}" || { echo "Error: failed to run $script"; exit 1; }; \
+                fi; \
+            done; \
+            # Final fallback: warn user
+            if [ $found -eq 0 ]; then \
+                echo "Error: no matching script found for custom op: $op"; exit 1; \
+            fi; \
+        done; \
+    fi && \
+    # rm -rf /workspace/dist && \
+    pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} \
+        -r /workspace/requirements/develop.txt && \
+    pip uninstall -y triton && \
+    rm -rf /workspace/requirements && \
     echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib64:/usr/local/lib:/workspace/dist/lib' >> ~/.bashrc;
 
 ENTRYPOINT ["bash"]
@@ -117,17 +148,8 @@ RUN export http_proxy=${HTTP_PROXY} && \
     # Install high version of hf_xet 1.1.10 to solve the problem of downloading the HF model.
 
 # Example config to run api_server
-ENV GLOO_SOCKET_IFNAME=lo \
-    VLLM_USE_V1=1 \
-    VLLM_WORKER_MULTIPROC_METHOD=fork \
-    VLLM_ENABLE_MC2=0 \
-    USING_LCCL_COM=0 \
-    VLLM_LOGGING_LEVEL=DEBUG \
-    HOST=0.0.0.0 \
-    PORT=8301 \
-    TZ=Asia/Shanghai
+# NOTE: environment variable defaults moved into /usr/local/bin/start_server.sh
 
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 COPY start_server.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/start_server.sh

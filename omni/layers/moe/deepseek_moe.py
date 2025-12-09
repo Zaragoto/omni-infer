@@ -45,6 +45,8 @@ from vllm.model_executor.layers.linear import (
 )
 from omni.layers.linear import (
     MergedReplicatedLinear,
+    AscendMergedColumnParallelLinear,
+    AscendRowParallelLinear
 )
 from omni.layers.activation import SiluAndMul
 from omni.layers.moe.fused_moe.layer import FusedMoE, UNQUANT_MODE, DYNAMIC_QUANT_MODE, FakeMoe
@@ -56,7 +58,10 @@ from omni.adaptors.vllm.distributed.communication_op import (
     all_gather_cross
 )
 from omni.adaptors.vllm.distributed.parallel_state import (
-    get_round_cross_group_from_list
+    get_round_cross_group_from_list,
+    get_mlp_tp_group,
+    get_local_world_group,
+    GroupCoordinator
 )
 from omni.layers.moe.fused_moe.layer import FusedMoE
 from omni.models.config_loader.loader import model_extra_config
@@ -138,6 +143,61 @@ class ReplicatedDeepseekMLP(nn.Module):
         gate_up, _ = self.gate_up_proj.forward(x)
         x = self.act_fn(gate_up, self.quant_symbol)
         x, _ = self.down_proj.forward(x)
+        return x
+
+class ParallelDeepseekMLP(nn.Module):
+    def __init__(
+            self,
+            hidden_size: int,
+            intermediate_size: int,
+            hidden_act: str,
+            quant_config: Optional[QuantizationConfig] = None,
+            reduce_results: bool = True,
+            prefix: str = "",
+            comm_group: Optional[GroupCoordinator] = get_mlp_tp_group()
+    ) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.gate_up_proj = AscendMergedColumnParallelLinear(
+            hidden_size, [intermediate_size] * 2,
+            tp_size=comm_group.world_size,
+            tp_rank=comm_group.rank_in_group,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj")
+        self.down_proj = AscendRowParallelLinear(intermediate_size,
+                                           hidden_size,
+                                           bias=False,
+                                           tp_size=comm_group.world_size,
+                                           tp_rank=comm_group.rank_in_group,
+                                           quant_config=quant_config,
+                                           reduce_results=False,
+                                           prefix=f"{prefix}.down_proj")
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn_obj = SiluAndMul()
+        self.quant_symbol = True if quant_config else False
+        self.comm_group = comm_group
+
+    def act_fn(self, x, quant_symbol):
+        if quant_symbol and isinstance(x, tuple):
+            x = dict(zip(['x_int8', 'pertoken_scale'], x))
+            x['out_scale'] = self.gate_up_proj.weight_scale
+        return self.act_fn_obj(x, quant_symbol)
+
+
+    def forward(self, x, residual=None, attn_metadata=None, layerid=None):
+        x = self.comm_group.all_gather(x, dim=0)
+
+        gate_up, _ = self.gate_up_proj.forward(x)
+        x = self.act_fn(gate_up, self.quant_symbol)
+        x, _ = self.down_proj.forward(x)
+
+        # P and D are both cut, and are concave at the node (16)
+        x = self.comm_group.reduce_scatter(x)
+        if residual is not None:
+            return x, residual
         return x
 
 def DynamicPruningUnsorted(topk_weights: torch.Tensor, 
@@ -222,7 +282,7 @@ class DeepseekMoE(nn.Module):
         self.shared_experts = None
         self.experts = None
         self.fake_experts = None
-        self.global_rank = get_world_group().rank_in_group
+        self.global_rank = get_ep_group().rank_in_group
         self.planner = None
         self.moe_layer_idx = None
         self.expert_mapping = None
@@ -265,7 +325,7 @@ class DeepseekMoE(nn.Module):
                     from omni.accelerators.placement.omni_placement.omni_planner import OmniPlanner
                     self.planner = OmniPlanner(device="npu",
                                             rank=get_world_group().rank_in_group,
-                                            world_size=get_world_group().world_size,
+                                            world_size=get_ep_group().world_size,
                                             num_experts=self.n_routed_experts,
                                             num_redundancy_shared_expert_rank=self.redundancy_shared_expert_num)
                     self.moe_layer_idx = OmniPlanner.get_deepseek_v3_moe_layer_idx(moe_prefix, first_k_dense_replace=self.first_k_dense_replace)
@@ -304,17 +364,27 @@ class DeepseekMoE(nn.Module):
                                             num_redundancy_shared_expert_rank=self.redundancy_shared_expert_num)
                     self.moe_layer_idx = OmniPlanner.get_deepseek_v3_moe_layer_idx(f"{prefix}.share_experts", first_k_dense_replace=self.first_k_dense_replace)
                     self.expert_mapping = self.planner.expert_mapping_on_current_layer(self.moe_layer_idx, is_prefill=False)
-
-                self.shared_experts = ReplicatedDeepseekMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=f"{prefix}.shared_experts",
-                )
                 self.gate_up_prefetch_size = model_extra_config.operator_opt_config.shared_expert_gate_up_prefetch * 1024 * 1024
                 self.down_prefetch_size = model_extra_config.operator_opt_config.shared_expert_down_prefetch * 1024 * 1024
+                if model_extra_config.parall_config.enable_share_expert_tp:
+                    self.shared_experts = ParallelDeepseekMLP(
+                        hidden_size=config.hidden_size,
+                        intermediate_size=intermediate_size,
+                        hidden_act=config.hidden_act,
+                        quant_config=quant_config,
+                        reduce_results=False,
+                        prefix=f"{prefix}.shared_experts",
+                        comm_group=get_local_world_group()
+                    )
+                else:
+                    self.shared_experts = ReplicatedDeepseekMLP(
+                        hidden_size=config.hidden_size,
+                        intermediate_size=intermediate_size,
+                        hidden_act=config.hidden_act,
+                        quant_config=quant_config,
+                        reduce_results=False,
+                        prefix=f"{prefix}.shared_experts",
+                    )
             
             if model_extra_config.task_config.enable_omni_placement:
                 self.n_redundant_experts = self.planner.get_num_of_redundant_experts(moe_layer_idx=self.moe_layer_idx,
@@ -536,15 +606,22 @@ class DeepseekMoE(nn.Module):
         hidden_states_3d = hidden_states.unsqueeze(1)
         hidden_states = hidden_states_3d.squeeze(1)
 
-        with tng.scope.npu_stream_switch(STREAM_SHARED_EXPERT):
-            hidden_states = tng.scope.npu_wait_tensor(hidden_states, hidden_states_float)
-            x_quant, x_scale = torch_npu.npu_dynamic_quant(hidden_states)
-            hidden_states_quant = {"x_int8": x_quant, "pertoken_scale": x_scale}
+        if self.quant_symbol:
+            with tng.scope.npu_stream_switch(STREAM_SHARED_EXPERT):
+                hidden_states = tng.scope.npu_wait_tensor(hidden_states, hidden_states_float)
+                x_quant, x_scale = torch_npu.npu_dynamic_quant(hidden_states)
+                hidden_states_quant = {"x_int8": x_quant, "pertoken_scale": x_scale}
 
-        with tng.scope.npu_stream_switch(STREAM_SHARED_EXPERT):
-            x_quant = tng.scope.npu_wait_tensor(x_quant, router_logits)
-            # shared_experts w13
-            gate_up_share, _ = self.shared_experts.gate_up_proj.forward(hidden_states_quant)
+            with tng.scope.npu_stream_switch(STREAM_SHARED_EXPERT):
+                x_quant = tng.scope.npu_wait_tensor(x_quant, router_logits)
+                # shared_experts w13
+                gate_up_share, _ = self.shared_experts.gate_up_proj.forward(hidden_states_quant)
+        else:
+            with tng.scope.npu_stream_switch(STREAM_SHARED_EXPERT):
+                hidden_states = tng.scope.npu_wait_tensor(hidden_states, hidden_states_float)
+                # shared_experts w13
+                gate_up_share, _ = self.shared_experts.gate_up_proj.forward(hidden_states)
+
         wait_gate = gate_up_share if isinstance(gate_up_share, torch.Tensor) else gate_up_share[0]
         
         # expert weight prefetch
@@ -589,10 +666,10 @@ class DeepseekMoE(nn.Module):
         }
 
         experts_tp_size = layer.tp_size
-        world_size = get_world_group().world_size
+        world_size = get_ep_group().world_size
         # In fact, what we get is the die number, and the ep group is not adapted by default.
         # The default ep group is experts_num/die_num.
-        global_rank = get_world_group().rank_in_group
+        global_rank = get_ep_group().rank_in_group
         all_to_all_group_size = world_size // experts_tp_size
 
         kwargs.update({

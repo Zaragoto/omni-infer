@@ -1,4 +1,4 @@
-{
+{ "omni_logging_format":true,
   "formatters": {
     "vllm": {
       "class": "vllm.logging_utils.NewLineFormatter",
@@ -11,10 +11,12 @@
       "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
       "formatter": "vllm",
       "level": "INFO",
-      "maxBytes": 31457280,
-      "backupCount": 5,
+      "maxBytes": 104857600,
+      "backupCount": 10,
       "filename": "/home/ma-user/run.log",
-      "delay": true
+      "delay": true,
+      "use_gzip":true,
+      "encoding":"utf-8"
     },
     "console": {
       "class": "logging.StreamHandler",

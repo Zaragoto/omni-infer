@@ -76,7 +76,6 @@ aclrtMemcpyAsync.restype = ctypes.c_int
 class AscendCLStream:    
     def __init__(self):
         self._stream = aclrtStream()
-        self.create()
     
     def create(self):
         rc = aclrtCreateStream(ctypes.byref(self._stream))

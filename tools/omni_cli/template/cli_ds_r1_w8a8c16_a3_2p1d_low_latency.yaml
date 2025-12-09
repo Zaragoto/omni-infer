@@ -97,7 +97,7 @@ all:
             PREFILL_POD_NUM: 2
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
             RANKTABLE_SAVE_PATH: /tmp/ranktable_save_path
-            RANK_TABLE_FILE_PATH: $(ls /tmp/ranktable_save_path/global/collect_files_d/local_*merge.json)
+            RANK_TABLE_FILE_PATH: $(ls ${RANKTABLE_SAVE_PATH}/global/collect_files_d/local_*merge.json)
             ROLE: decode
             SERVER_IP_LIST: 127.0.0.2,127.0.0.3,127.0.0.4,127.0.0.5
             SERVER_OFFSET: 0
@@ -196,7 +196,7 @@ all:
             PREFILL_POD_NUM: 2
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
             RANKTABLE_SAVE_PATH: /tmp/ranktable_save_path
-            RANK_TABLE_FILE_PATH: $(ls /tmp/ranktable_save_path/global/collect_files_d/local_*merge.json)
+            RANK_TABLE_FILE_PATH: $(ls ${RANKTABLE_SAVE_PATH}/global/collect_files_d/local_*merge.json)
             ROLE: decode
             SERVER_IP_LIST: 127.0.0.2,127.0.0.3,127.0.0.4,127.0.0.5
             SERVER_OFFSET: 16
@@ -295,7 +295,7 @@ all:
             PREFILL_POD_NUM: 2
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
             RANKTABLE_SAVE_PATH: /tmp/ranktable_save_path
-            RANK_TABLE_FILE_PATH: $(ls /tmp/ranktable_save_path/global/collect_files_d/local_*merge.json)
+            RANK_TABLE_FILE_PATH: $(ls ${RANKTABLE_SAVE_PATH}/global/collect_files_d/local_*merge.json)
             ROLE: decode
             SERVER_IP_LIST: 127.0.0.2,127.0.0.3,127.0.0.4,127.0.0.5
             SERVER_OFFSET: 32
@@ -394,7 +394,7 @@ all:
             PREFILL_POD_NUM: 2
             PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
             RANKTABLE_SAVE_PATH: /tmp/ranktable_save_path
-            RANK_TABLE_FILE_PATH: $(ls /tmp/ranktable_save_path/global/collect_files_d/local_*merge.json)
+            RANK_TABLE_FILE_PATH: $(ls ${RANKTABLE_SAVE_PATH}/global/collect_files_d/local_*merge.json)
             ROLE: decode
             SERVER_IP_LIST: 127.0.0.2,127.0.0.3,127.0.0.4,127.0.0.5
             SERVER_OFFSET: 48

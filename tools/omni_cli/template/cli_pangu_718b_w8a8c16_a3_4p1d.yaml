@@ -62,6 +62,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_d0
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9100
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3
@@ -182,6 +183,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_d1
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9116
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3
@@ -302,6 +304,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_d2
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9132
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3
@@ -422,6 +425,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_d3
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9148
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3
@@ -543,6 +547,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_p0
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9000
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3
@@ -664,6 +669,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_p1
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9016
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3
@@ -785,6 +791,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_p2
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9032
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3
@@ -906,6 +913,7 @@ all:
           ascend_rt_visible_devices: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
           container_name: pangu4p1d_p3
           env:
+            OMNI_DISABLE_NPU_TOP_K_TOP_P_SAMPLE: 1
             API_PORT: 9048
             HCCL_OP_EXPANSION_MODE: "AIV"
             ASCEND_GLOBAL_LOG_LEVEL: 3

@@ -213,10 +213,9 @@ class KVCacheMemoryPool:
 
         return block_tensors
 
-    def batch_layer_copy_to_npu(self, block_ids: list, npu_blocks, device_id: int, layer_indices: Optional[List[int]] = None):
+    def batch_layer_copy_to_npu(self, block_ids: list, npu_blocks, layer_indices: Optional[List[int]] = None):
         """Batch copy specific layers of multiple blocks from CPU shared memory to NPU, merging consecutive blocks with continuous addresses (for batch copy)."""
 
-        start_time = time.time()
         cpu_blocks = [self.get_block(block_id) for block_id in block_ids]
         layers = len(npu_blocks[0]) # npu_blocks layout: [block][layer][kvi_tensor]
 
@@ -247,228 +246,37 @@ class KVCacheMemoryPool:
                         else:
                             break
                     count_blocks = batch_end - batch_start
-                    batch_device_mem.append(ctypes.c_void_p(npu_addrs[batch_start]))
+                    batch_device_mem.append(npu_addrs[batch_start])
                     batch_device_max.append(tensor_size * count_blocks)
-                    batch_host_mem.append(ctypes.c_void_p(cpu_addrs[batch_start]))
+                    batch_host_mem.append(cpu_addrs[batch_start])
                     batch_host_sizes.append(tensor_size * count_blocks)
                     batch_start = batch_end
+        
+        return batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes
+
+    def memcpy_async(self, batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes):
+
+        start_time = time.time()
 
         batch_count = len(batch_device_mem)
 
-        device_mem = (ctypes.c_void_p * batch_count)(*batch_device_mem)
-        device_max = (ctypes.c_size_t * batch_count)(*batch_device_max)
-        host_mem = (ctypes.c_void_p * batch_count)(*batch_host_mem)
-        host_sizes = (ctypes.c_size_t * batch_count)(*batch_host_sizes)
-        fails = (ctypes.c_size_t * 1)()
-
-        attrs = (aclrtMemcpyBatchAttr * 1)()
-        attrsIndex = (ctypes.c_size_t * 1)()
-
-        fails[0] = ctypes.c_size_t(-1).value
-        attrs[0].dstLoc.id = device_id
-        attrs[0].dstLoc.type = ACL_MEM_LOCATION_TYPE_DEVICE
-        attrs[0].srcLoc.id = 0
-        attrs[0].srcLoc.type = ACL_MEM_LOCATION_TYPE_HOST
-        attrsIndex[0] = 0
-
-        if int(os.environ.get("BATCH_COPY_ASYNC", "0")) == 1:
-            rc = self.ascend_cl_stream.memcpy_batch_async(
+        for idx in range(len(batch_device_mem)):
+            device_mem = ctypes.c_void_p(batch_device_mem[idx])
+            device_max = batch_device_max[idx]
+            host_mem = ctypes.c_void_p(batch_host_mem[idx])
+            host_sizes = batch_host_sizes[idx]
+            rc = self.ascend_cl_stream.memcpy_async(
                 device_mem,
                 device_max,
                 host_mem,
                 host_sizes,
-                batch_count,
-                attrs,
-                attrsIndex,
-                1,
-                fails
+                1
             )
-        else:
-            rc = self.ascend_cl_stream.memcpy_batch(
-                device_mem,
-                device_max,
-                host_mem,
-                host_sizes,
-                batch_count,
-                attrs,
-                attrsIndex,
-                1,
-                fails
-            )
-        if rc != 0:
-            raise ValueError(f"Batch copy failed with return code {rc}")
-        # self.ascend_cl_stream.sync() # do sync outside this function to overlap with other computations
 
+        mb_copied = sum(batch_host_sizes) >> 20
+        self.ascend_cl_stream.sync()
         duration = time.time() - start_time
-        mb_copied = (self.block_size_bytes * len(block_ids)) >> 20
         logger.warning(f"Batch (merged) {batch_count} copy {mb_copied} MB took {duration * 1000:.2f} ms")
-
-    """ Switched to MemcpyBatch with merging consecutive blocks, this code is kept for backup only """
-    # def batch_layer_copy_to_npu(self,
-    #                         block_ids: list,
-    #                         npu_blocks,
-    #                         layer_num: int,
-    #                         device_id: int):
-    #     """ Do MemcpyAsync for multiple blocks layer by layer from CPU shared memory to NPU, with merging consecutive blocks to copy at once. """
-    #     start_time = time.time()
-    #     cpu_blocks = [self.get_block(block_id) for block_id in block_ids]
-    #     layers = len(npu_blocks[0])
-    #     tensor_size = cpu_blocks[0][0][0].nbytes
-
-    #     copy_times = 0
-    #     for layer_idx in range(layers):
-    #         # preprocess host/device addresses for all blocks
-    #         cpu_addrs = [cpu_blocks[i][0][layer_idx].unsqueeze(-2).data_ptr() for i in range(len(block_ids))]
-    #         npu_addrs = [npu_blocks[i][layer_idx][0].data_ptr() for i in range(len(block_ids))]
-    #         batch_start = 0
-    #         while batch_start < len(block_ids):
-    #             batch_end = batch_start + 1
-    #             prev_cpu_addr = cpu_addrs[batch_start]
-    #             prev_npu_addr = npu_addrs[batch_start]
-    #             while batch_end < len(block_ids):
-    #                 curr_cpu_addr = cpu_addrs[batch_end]
-    #                 curr_npu_addr = npu_addrs[batch_end]
-    #                 if (curr_cpu_addr == prev_cpu_addr + tensor_size and
-    #                     curr_npu_addr == prev_npu_addr + tensor_size):
-    #                     prev_cpu_addr = curr_cpu_addr
-    #                     prev_npu_addr = curr_npu_addr
-    #                     batch_end += 1
-    #                 else:
-    #                     break
-    #             # merge consecutive blocks
-    #             count_blocks = batch_end - batch_start
-    #             device_mem = ctypes.c_void_p(npu_addrs[batch_start])
-    #             device_max = tensor_size * count_blocks
-    #             host_mem = ctypes.c_void_p(cpu_addrs[batch_start])
-    #             host_sizes = tensor_size * count_blocks
-
-    #             rc = self.ascend_cl_stream.memcpy_async(
-    #                 device_mem,
-    #                 device_max,
-    #                 host_mem,
-    #                 host_sizes,
-    #                 ACL_MEMCPY_HOST_TO_DEVICE
-    #             )
-    #             batch_start = batch_end
-    #             copy_times += 1
-    #     self.ascend_cl_stream.sync()
-
-    #     duration = time.time() - start_time
-    #     mb_copied = (self.block_size_bytes * len(block_ids)) >> 20
-    #     logger.warning(f"AclMemoryCopyAsync copy {mb_copied} MB"
-    #                    f" (total batch count is {layer_num*len(block_ids)}, merged to {copy_times} times) "
-    #                    f"took {duration * 1000:.2f} ms")
-
-    """ Switched to MemcpyAsync with merging consecutive blocks, this code is kept for backup only"""
-    # def batch_layer_copy_to_npu(self,
-    #                             block_ids: List[int],
-    #                             npu_blocks,
-    #                             layer_num: int,
-    #                             device_id: int):
-    #     """Batch copy specific layers of multiple blocks from CPU shared memory to NPU."""
-    #     start_time = time.time()
-    #     cpu_blocks = [self.get_block(block_id) for block_id in block_ids]
-
-    #     num_blocks = len(cpu_blocks)
-    #     layers = len(npu_blocks[0])
-    #     batch_count = num_blocks * layers
-
-    #     for block_idx, (cpu_block, npu_block) in enumerate(zip(cpu_blocks, npu_blocks)):
-    #         for layer_idx in range(layers):
-    #             cpu_tensor = cpu_block[0][layer_idx].unsqueeze(-2)
-    #             npu_tensor = npu_block[layer_idx][0]
-
-    #             device_mem = ctypes.c_void_p(npu_tensor.data_ptr())
-    #             device_max = cpu_blocks[0][0][0].nbytes
-
-    #             host_mem = ctypes.c_void_p(cpu_tensor.data_ptr())
-    #             host_sizes = cpu_blocks[0][0][0].nbytes
-
-    #             rc = self.ascend_cl_stream.memcpy_async(
-    #                     device_mem,
-    #                     device_max,
-    #                     host_mem,
-    #                     host_sizes,
-    #                     ACL_MEMCPY_HOST_TO_DEVICE
-    #                 )
-    #     self.ascend_cl_stream.sync()
-
-    #     duration = time.time() - start_time
-    #     mb_copied = (self.block_size_bytes * len(block_ids)) >> 20
-    #     logger.warning(f"**** AclMemoryCopyAsync copy {mb_copied} MB took {duration * 1000:.2f} ms")
-
-    """ Switched to aclMemcpyAsync, this code is kept for backup only """
-    # def batch_layer_copy_to_npu(self, block_ids: List[int], npu_blocks, layer_num: int, device_id: int):
-    #     """Batch copy specific layers of multiple blocks from CPU shared memory to NPU."""
-    #     start_time = time.time()
-    #     cpu_blocks = [self.get_block(block_id) for block_id in block_ids]
-
-    #     if dump_data:
-    #         dump_dir = f"/data/szh/debug_omni_cache/dump_kv_states_d"
-    #         os.makedirs(dump_dir, exist_ok=True)
-
-    #         for i, cpu_block in enumerate(cpu_blocks):
-    #             torch.save(cpu_blocks, os.path.join(dump_dir, f"cpu_blocks_blockID-{block_ids[i]}.pt"))
-
-    #     num_blocks = len(cpu_blocks)
-    #     batch_count = num_blocks * layer_num
-
-    #     device_mem = (ctypes.c_void_p * batch_count)()
-    #     device_max = (ctypes.c_size_t * batch_count)()
-    #     host_mem = (ctypes.c_void_p * batch_count)()
-    #     host_sizes = (ctypes.c_size_t * batch_count)()
-    #     fails = (ctypes.c_size_t * 1)()
-
-    #     attrs = (aclrtMemcpyBatchAttr * 1)()
-    #     attrsIndex = (ctypes.c_size_t * 1)()
-
-    #     layers = len(npu_blocks[0])
-    #     print(f"Layers count: {layers}")
-
-    #     offset = 0
-    #     for block_idx, (cpu_block, npu_block) in enumerate(zip(cpu_blocks, npu_blocks)):
-    #         for layer_idx in range(layers):
-    #             cpu_tensor = cpu_block[0][layer_idx].unsqueeze(-2)
-    #             npu_tensor = npu_block[layer_idx][0]
-
-    #             device_mem[offset] = ctypes.c_void_p(npu_tensor.data_ptr())
-    #             device_max[offset] = cpu_blocks[0][0][0].nbytes
-
-    #             host_mem[offset] = ctypes.c_void_p(cpu_tensor.data_ptr())
-    #             host_sizes[offset] = cpu_blocks[0][0][0].nbytes
-
-    #             offset += 1
-
-    #     fails[0] = ctypes.c_size_t(-1).value
-
-    #     attrs[0].dstLoc.id = device_id
-    #     attrs[0].dstLoc.type = ACL_MEM_LOCATION_TYPE_DEVICE
-    #     attrs[0].srcLoc.id = 0
-    #     attrs[0].srcLoc.type = ACL_MEM_LOCATION_TYPE_HOST
-    #     attrsIndex[0] = 0
-
-    #     rc = aclrtMemcpyBatch(
-    #         device_mem,
-    #         device_max,
-    #         host_mem,
-    #         host_sizes,
-    #         batch_count,
-    #         attrs,
-    #         attrsIndex,
-    #         1,
-    #         fails
-    #     )
-
-    #     if rc != 0:
-    #         raise ValueError(f"Batch copy failed with return code {rc}")
-
-    #     duration = time.time() - start_time
-    #     mb_copied = (self.block_size_bytes * num_blocks) >> 20
-    #     logger.warning(f"Batch {batch_count} copy {mb_copied} MB took {duration * 1000:.2f} ms")
-
-
-    #     duration = time.time() - start_time
-    #     logger.warning(f"Batch {batch_count} copy {(self.block_size_bytes * len(block_ids)) >> 20} MB takes {duration * 1000}ms")
 
     def set_block(self, block_idx: int, tensors: List[torch.Tensor]) -> None:
         """Set key, value, metadata tensors for the specified block index."""

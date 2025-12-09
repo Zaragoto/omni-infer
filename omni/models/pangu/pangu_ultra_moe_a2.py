@@ -332,7 +332,7 @@ class PanguUltraMoEDecoderLayer(nn.Module):
             # Adapt: adapt for w8a8 dynamic, do quant
             # Combines residual add and rmsnorm
             hidden_states, residual = self.input_layernorm(
-                hidden_states, residual, quant_symbol=True)
+                hidden_states, residual, quant_symbol=(not model_extra_config.operator_opt_config.use_mlaprolog and not model_extra_config.operator_opt_config.enable_dsa))
 
         hidden_states = self.self_attn(
             positions=positions,

@@ -55,7 +55,7 @@ from omni.layers.linear import (
     RowParallelFlashCommLinear,
     QKVParallelFlashCommLinear
 )
-from omni.layers.rotary_embedding import get_rope, QwenRotaryEmbedding, QwenMRotaryEmbedding
+from omni.layers.rotary_embedding import get_rope, MRotaryEmbeddingInterleaved, QwenRotaryEmbedding, QwenMRotaryEmbedding
 from omni.models.config_loader.loader import model_extra_config
 
 DEFAULT_ROPE_THETA = 1000000
@@ -195,7 +195,7 @@ class PanguEmbeddedAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states, x_transform=x_transform)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if type(self.rotary_emb) is QwenMRotaryEmbedding:
+        if type(self.rotary_emb) in [QwenMRotaryEmbedding, MRotaryEmbeddingInterleaved]:
             q, k = self.rotary_emb(positions, q, k)
         else:
             q, k = self.rotary_emb(positions, q, k, cos, sin)
@@ -213,7 +213,7 @@ class PanguEmbeddedAttention(nn.Module):
 
         if rope_scaling is None:
             rope_scaling = {'factor': '0'}
-        rope_scaling["rope_type"] = 'qwen'
+        rope_scaling["rope_type"] = 'pangu'
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -326,7 +326,7 @@ class PanguEmbeddedDecoderLayer(nn.Module):
         if attn_metadata is not None and attn_metadata[next(iter(attn_metadata))].attn_state == AscendAttentionState.PrefillNoCache:
             is_prefill = True
         else:
-            is_prefill = False       
+            is_prefill = False
         if model_extra_config.operator_opt_config.use_prefetch and not is_prefill:
             mlp_layer = [self.mlp.gate_up_proj, self.mlp.down_proj]
             attn_layer = [next_layer.self_attn.qkv_proj, next_layer.self_attn.o_proj] if next_layer else None
@@ -465,7 +465,7 @@ class PanguEmbeddedModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        if type(self.layers[0].self_attn.rotary_emb) is QwenMRotaryEmbedding:
+        if type(self.layers[0].self_attn.rotary_emb) in [QwenMRotaryEmbedding, MRotaryEmbeddingInterleaved]:
             cos = None
             sin = None
         else:

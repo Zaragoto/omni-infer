@@ -199,10 +199,6 @@ class CcConnectorScheduler:
         return True
     
     def _need_save(self, num_computed_blocks: int, num_total_blocks: int) -> bool:
-        # 长度小于ems_num_min_reuse_tokens, 不save
-        if num_total_blocks * self.block_size < EmsEnv.ems_num_min_reuse_tokens:
-            return False
-        
         if num_total_blocks <= num_computed_blocks:
             return False
         
